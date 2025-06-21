@@ -10,14 +10,15 @@
   pkgs ? import <nixpkgs> { },
 }:
 
-{
+rec {
   # The `lib`, `modules`, and `overlays` names are special
   lib = import ./lib { inherit pkgs; }; # functions
   modules = import ./modules; # NixOS modules
   overlays = import ./overlays; # nixpkgs overlays
 
-  example-package = pkgs.callPackage ./pkgs/example-package { };
   matrix-onebot = pkgs.callPackage ./pkgs/matrix-onebot { };
+  libvirt-dbus = pkgs.callPackage ./pkgs/libvirt-dbus { };
+  cockpit-machines = pkgs.callPackage ./pkgs/cockpit-machines { inherit libvirt-dbus; };
   # some-qt5-package = pkgs.libsForQt5.callPackage ./pkgs/some-qt5-package { };
   # ...
 }
