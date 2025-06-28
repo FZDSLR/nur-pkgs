@@ -19,6 +19,5 @@ rec {
   matrix-onebot = pkgs.callPackage ./pkgs/matrix-onebot { };
   libvirt-dbus = pkgs.callPackage ./pkgs/libvirt-dbus { };
   cockpit-machines = pkgs.callPackage ./pkgs/cockpit-machines { inherit libvirt-dbus; };
-  # some-qt5-package = pkgs.libsForQt5.callPackage ./pkgs/some-qt5-package { };
-  # ...
+  openlist = pkgs.callPackage ./pkgs/openlist { };
 }
