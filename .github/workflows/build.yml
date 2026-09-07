@@ -38,7 +38,21 @@ jobs:
           - nixpkgs=https://github.com/NixOS/nixpkgs/archive/refs/heads/nixpkgs-unstable.tar.gz
           - nixpkgs=https://github.com/NixOS/nixpkgs/archive/refs/heads/nixos-unstable.tar.gz
           - nixpkgs=https://github.com/NixOS/nixpkgs/archive/refs/heads/nixos-26.05.tar.gz
-    runs-on: ubuntu-latest
+        # GitHub-hosted arm64 runner (free for public repos). Pairs with
+        # `system` below to drive nix-build-uncached into building aarch64.
+        runs-on:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+        system:
+          - x86_64-linux
+          - aarch64-linux
+        # Skip incompatible runner/arch combos.
+        exclude:
+          - runs-on: ubuntu-24.04-arm
+            system: x86_64-linux
+          - runs-on: ubuntu-latest
+            system: aarch64-linux
+    runs-on: ${{ matrix.runs-on }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v6
@@ -69,7 +83,7 @@ jobs:
           -I nixpkgs=$(nix-instantiate --find-file nixpkgs) \
           -I $PWD
     - name: Build nix packages
-      run: nix shell -f '<nixpkgs>' nix-build-uncached -c nix-build-uncached ci.nix -A cacheOutputs
+      run: nix shell -f '<nixpkgs>' nix-build-uncached -c nix-build-uncached ci.nix -A cacheOutputs --system ${{ matrix.system }}
     # - name: Trigger NUR update
     #   # Don't replace <YOUR_REPO_NAME> here!
     #   if: ${{ matrix.nurRepo != '<YOUR_REPO_NAME>' }}
