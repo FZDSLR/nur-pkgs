@@ -16,4 +16,5 @@ rec {
   modules = import ./modules; # NixOS modules
   overlays = import ./overlays; # nixpkgs overlays
 
+  niri-patched = import ./pkgs/niri-patched { inherit pkgs; };
 }
