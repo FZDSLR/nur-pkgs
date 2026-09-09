@@ -1,0 +1,93 @@
+From de3fe40658752e4cde240b5f70217b83e4abd2cf Mon Sep 17 00:00:00 2001
+From: Ashley Smith <ashley.smith@collabora.com>
+Date: Mon, 24 Aug 2026 13:28:26 +0100
+Subject: [PATCH] panfrost: Fix async AFBC packing incorrectly assuming job
+ submission
+
+We incorrectly assumed that the _sizes() job and _pack() job were
+submitted in pan_resource_afbcp_update(). Since this isn't the case and
+we are inside of setting up a batch, delay the wait until no pending
+batches write the BO. We will always flush on a frame boundary anyway.
+
+Fixes: 91aa7c4f8d6 ("panfrost: Async AFBC packing")
+---
+ src/gallium/drivers/panfrost/pan_job.c      | 23 +++++++++++++++++++++
+ src/gallium/drivers/panfrost/pan_job.h      |  3 +++
+ src/gallium/drivers/panfrost/pan_resource.c |  6 ++++--
+ 3 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/panfrost/pan_job.c b/src/gallium/drivers/panfrost/pan_job.c
+index 6dfde4e2933d..27283743919c 100644
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -841,6 +841,29 @@ panfrost_any_batch_writes_rsrc(struct panfrost_context *ctx,
+    return _mesa_hash_table_search(ctx->writers, rsrc) != NULL;
+ }
+ 
++bool
++panfrost_any_batch_writes_bo(struct panfrost_context *ctx,
++                             struct panfrost_bo *bo)
++{
++   unsigned i;
++   foreach_batch(ctx, i) {
++      struct panfrost_batch *batch = &ctx->batches.slots[i];
++
++      uint32_t handle = panfrost_bo_handle(bo);
++      unsigned size = util_dynarray_num_elements(&batch->bos, pan_bo_access);
++
++      if (handle >= size)
++         return false;
++
++      pan_bo_access access =
++         *util_dynarray_element(&batch->bos, pan_bo_access, handle);
++      if ((access & PAN_BO_ACCESS_WRITE) != 0)
++         return true;
++   }
++
++   return false;
++}
++
+ void
+ panfrost_batch_adjust_stack_size(struct panfrost_batch *batch)
+ {
+diff --git a/src/gallium/drivers/panfrost/pan_job.h b/src/gallium/drivers/panfrost/pan_job.h
+index 4e47406ac119..20f44080c259 100644
+--- a/src/gallium/drivers/panfrost/pan_job.h
++++ b/src/gallium/drivers/panfrost/pan_job.h
+@@ -213,6 +213,9 @@ bool panfrost_any_batch_reads_rsrc(struct panfrost_context *ctx,
+ bool panfrost_any_batch_writes_rsrc(struct panfrost_context *ctx,
+                                     struct panfrost_resource *rsrc);
+ 
++bool panfrost_any_batch_writes_bo(struct panfrost_context *ctx,
++                                  struct panfrost_bo *bo);
++
+ struct panfrost_bo *panfrost_batch_create_bo(struct panfrost_batch *batch,
+                                              size_t size, uint32_t create_flags,
+                                              mesa_shader_stage stage,
+diff --git a/src/gallium/drivers/panfrost/pan_resource.c b/src/gallium/drivers/panfrost/pan_resource.c
+index 178b7b8a5624..b80c92e8dd82 100644
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -2231,7 +2231,8 @@ pan_resource_afbcp_update(struct panfrost_context *ctx,
+ 
+    /* 2nd async AFBC-P step: get payload offsets. */
+    if (prsrc->afbcp->size == 0) {
+-      if (!panfrost_bo_wait(prsrc->afbcp->layout_bo, 0, false))
++      if (panfrost_any_batch_writes_bo(ctx, prsrc->afbcp->layout_bo) ||
++          !panfrost_bo_wait(prsrc->afbcp->layout_bo, 0, false))
+          return;
+       pan_resource_afbcp_get_payload_offsets(ctx, prsrc);
+       return;
+@@ -2256,7 +2257,8 @@ pan_resource_afbcp_update(struct panfrost_context *ctx,
+    }
+ 
+    /* 4th async AFBC-P step: commit. */
+-   if (!panfrost_bo_wait(prsrc->afbcp->packed_bo, 0, false))
++   if (panfrost_any_batch_writes_bo(ctx, prsrc->afbcp->packed_bo) ||
++       !panfrost_bo_wait(prsrc->afbcp->packed_bo, 0, false))
+       return;
+    pan_resource_afbcp_commit(ctx, prsrc);
+    return;
+-- 
+GitLab
+
