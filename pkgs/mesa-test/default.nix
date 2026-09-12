@@ -9,7 +9,7 @@ if pkgs.stdenv.hostPlatform.isAarch64 then
       ./43893.patch
       ./44053.patch
       ./42216.patch
-      ./44363-edited.patch
+      # ./44363-edited.patch
     ];
   })
 else
