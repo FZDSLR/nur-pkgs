@@ -1,0 +1,78 @@
+From 33024e5414959763bcab0a607d6ea64b5ac42b1e Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Tue, 1 Sep 2026 21:02:04 +0900
+Subject: [PATCH 1/2] panfrost: Reallocate BO when linear layout grows
+
+Commit 8dae6034 assumed that converting a tiled resource to linear
+would never require a larger allocation. This is not true for some
+resource sizes, because the linear layout may have a larger row stride
+and additional alignment padding.
+
+For some non-standard resource sizes, the linear layout can therefore
+be larger than the original tiled BO. Reallocate the BO when the
+linear layout does not fit instead of copying beyond the end of the
+existing BO.
+
+Fixes: 8dae6034310feea233e43b227703ef29fd8decde
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ src/gallium/drivers/panfrost/pan_resource.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/src/gallium/drivers/panfrost/pan_resource.c b/src/gallium/drivers/panfrost/pan_resource.c
+index 178b7b8a5624..d1e868ea7264 100644
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -2343,10 +2343,16 @@ panfrost_ptr_unmap(struct pipe_context *pctx, struct pipe_transfer *transfer)
+                panfrost_resource_setup(screen, prsrc, DRM_FORMAT_MOD_LINEAR,
+                                        prsrc->image.props.format, 0);
+ 
+-               /* converting the resource from tiled to linear and back
+-                * shouldn't increase memory usage...
+-                */
+-               assert(prsrc->plane.layout.data_size_B <= panfrost_bo_size(bo));
++               if (prsrc->plane.layout.data_size_B > panfrost_bo_size(bo)) {
++                  struct panfrost_bo *newbo = panfrost_bo_create(
++                     dev, prsrc->plane.layout.data_size_B, 0, bo->label);
++
++                  assert(newbo);
++                  panfrost_bo_unreference(prsrc->bo);
++                  prsrc->bo = newbo;
++                  prsrc->plane.base = newbo->ptr.gpu;
++                  bo = newbo;
++               }
+ 
+                util_copy_rect(
+                   bo->ptr.cpu + prsrc->plane.layout.slices[0].offset_B,
+-- 
+GitLab
+
+
+From 3c67cc30307864ce3507a114ab5551dae866bd8d Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Tue, 1 Sep 2026 21:02:35 +0900
+Subject: [PATCH 2/2] panfrost: Preserve BO flags during linear conversion
+
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ src/gallium/drivers/panfrost/pan_resource.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/panfrost/pan_resource.c b/src/gallium/drivers/panfrost/pan_resource.c
+index d1e868ea7264..188d507ee01f 100644
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -2344,8 +2344,9 @@ panfrost_ptr_unmap(struct pipe_context *pctx, struct pipe_transfer *transfer)
+                                        prsrc->image.props.format, 0);
+ 
+                if (prsrc->plane.layout.data_size_B > panfrost_bo_size(bo)) {
++                  uint32_t flags = bo->flags & ~PAN_BO_DELAY_MMAP;
+                   struct panfrost_bo *newbo = panfrost_bo_create(
+-                     dev, prsrc->plane.layout.data_size_B, 0, bo->label);
++                     dev, prsrc->plane.layout.data_size_B, flags, bo->label);
+ 
+                   assert(newbo);
+                   panfrost_bo_unreference(prsrc->bo);
+-- 
+GitLab
+
