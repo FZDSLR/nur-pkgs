@@ -1,0 +1,67 @@
+From 1a32aa9844b35af8b37ba3232bc8ae087b87c81f Mon Sep 17 00:00:00 2001
+From: Ahmed Hesham <ahmed.hesham@arm.com>
+Date: Fri, 12 Jun 2026 15:11:50 +0100
+Subject: [PATCH] pan: use exact coords for framebuffer preload
+
+The framebuffer preload shader samples the framebuffer using coordinates
+interpolated from a fullscreen varying. At large image sizes this can lose
+enough precision to sample the previous texel when preserving the pixels
+around a partial fill operation.
+
+Use frag_coord for x and y instead. Keep the varying for extra texture
+coordinates (i.e. z for 3D images or layer for image arrays).
+
+This fixes the failures observed in OpenCL-CTS test:
+test_cl_fill_images max_images 1D
+
+Fixes: 8ba2f9f69858 ("panfrost: Create a blitter library to replace the existing preload helpers")
+
+Signed-off-by: Ahmed Hesham <ahmed.hesham@arm.com>
+Reviewed-by: Eric Guo <eric.guo@nxp.com>
+---
+ src/gallium/drivers/panfrost/pan_fb_preload.c | 29 +++++++++++++++----
+ 1 file changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/src/gallium/drivers/panfrost/pan_fb_preload.c b/src/gallium/drivers/panfrost/pan_fb_preload.c
+index f321509bd335..5358437103d5 100644
+--- a/src/gallium/drivers/panfrost/pan_fb_preload.c
++++ b/src/gallium/drivers/panfrost/pan_fb_preload.c
+@@ -445,12 +445,29 @@ pan_preload_get_shader(struct pan_fb_preload_cache *cache,
+    nir_builder b = nir_builder_init_simple_shader(
+       MESA_SHADER_FRAGMENT, compiler_options, "pan_preload(%s)", sig);
+ 
+-   nir_def *barycentric = nir_load_barycentric(
+-      &b, nir_intrinsic_load_barycentric_pixel, INTERP_MODE_SMOOTH);
+-   nir_def *coord = nir_load_interpolated_input(
+-      &b, coord_comps, 32, barycentric, nir_imm_int(&b, 0),
+-      .base = attr_hw_index(0), .dest_type = nir_type_float32,
+-      .io_semantics.location = VARYING_SLOT_VAR0, .io_semantics.num_slots = 1);
++   nir_def *frag_coord = nir_load_frag_coord(&b);
++   nir_def *varying_coord = NULL;
++
++   if (coord_comps > 2) {
++      nir_def *barycentric = nir_load_barycentric(
++         &b, nir_intrinsic_load_barycentric_pixel, INTERP_MODE_SMOOTH);
++      varying_coord = nir_load_interpolated_input(
++         &b, coord_comps, 32, barycentric, nir_imm_int(&b, 0),
++         .base = attr_hw_index(0), .dest_type = nir_type_float32,
++         .io_semantics.location = VARYING_SLOT_VAR0,
++         .io_semantics.num_slots = 1);
++   }
++
++   nir_def *coord_chan[4] = {
++      nir_channel(&b, frag_coord, 0),
++      nir_channel(&b, frag_coord, 1),
++      varying_coord ? nir_channel(&b, varying_coord, 2)
++                    : nir_imm_float(&b, 0.0f),
++      varying_coord ? nir_channel(&b, varying_coord, 3)
++                    : nir_imm_float(&b, 0.0f),
++   };
++
++   nir_def *coord = nir_vec(&b, coord_chan, coord_comps);
+ 
+    unsigned active_count = 0;
+    for (unsigned i = 0; i < ARRAY_SIZE(key->surfaces); i++) {
+-- 
+GitLab
+
