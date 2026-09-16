@@ -10,7 +10,7 @@ if pkgs.stdenv.hostPlatform.isAarch64 then
       # BO-cache -> kernel shrinker race that triggers DATA_INVALID_FAULT
       # on Mali-G57 under memory pressure. Depends on the bo_access_lock
       # introduced by 41072.
-      ./panfrost-dontneed-drain.patch
+      # ./panfrost-dontneed-drain.patch
       ./43893.patch
       ./44053.patch
       ./42216.patch
