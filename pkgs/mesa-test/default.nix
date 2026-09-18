@@ -3,21 +3,20 @@
 }:
 
 let
-  # Only apply the test patches on mesa >= 26.2 (the codebase these
-  # patches were tested against). Older stable branches (e.g. 26.1.7
-  # on nixos-stable) must keep building `pkgs.mesa` as-is, since the
-  # panfrost source diverges across 26.1 -> 26.2.
+  # Apply the test patches only on mesa in [26.2, 26.2.3):
+  #   - < 26.2   : panfrost source diverges; keep pkgs.mesa as-is (stable).
+  #   - >= 26.2.3: upstream has moved on; keep pkgs.mesa as-is.
+  # Within the active window aarch64-linux gets every patch.
   applyPatches =
     pkgs.stdenv.hostPlatform.isAarch64
-    && pkgs.lib.versionAtLeast (pkgs.mesa.version or "0") "26.2";
+    && pkgs.lib.versionAtLeast (pkgs.mesa.version or "0") "26.2"
+    && pkgs.lib.versionOlder (pkgs.mesa.version or "0") "26.2.3";
 in
 if applyPatches then
   pkgs.mesa.overrideAttrs (oldAttrs: {
     patches = (oldAttrs.patches or [ ]) ++ [
       # ./41072.patch -- conflicts with 41123-edited (both touch gpu_access in pan_bo.c etc.)
-      (pkgs.lib.optional
-        (pkgs.lib.versionOlder (pkgs.mesa.version or "0") "26.2.3")
-        ./43893.patch)
+      ./43893.patch
       ./41123-edited.patch
       ./44053.patch
       ./42216.patch
