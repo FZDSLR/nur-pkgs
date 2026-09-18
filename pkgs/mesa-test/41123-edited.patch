@@ -1,0 +1,1120 @@
+diff --git a/src/gallium/drivers/panfrost/pan_bo.c b/src/gallium/drivers/panfrost/pan_bo.c
+index d0ce95c..995224a 100644
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -50,6 +50,24 @@ to_kmod_bo_flags(uint32_t flags)
+    return kmod_bo_flags;
+ }
+ 
++static void
++reset_bo_slot(struct panfrost_bo *bo)
++{
++   *bo = (struct panfrost_bo){
++      .seqno = bo->seqno,
++   };
++}
++
++UNUSED static bool
++bo_slot_is_free(struct panfrost_bo *bo)
++{
++   struct panfrost_bo expected = {
++      .seqno = bo->seqno,
++   };
++
++   return !memcmp(bo, &expected, sizeof(*bo));
++}
++
+ static struct panfrost_bo *
+ panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
+                   const char *label)
+@@ -66,7 +84,7 @@ panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
+       goto err_alloc;
+ 
+    bo = pan_lookup_bo(dev, kmod_bo->handle);
+-   assert(!memcmp(bo, &((struct panfrost_bo){0}), sizeof(*bo)));
++   assert(bo_slot_is_free(bo));
+    bo->kmod_bo = kmod_bo;
+ 
+    struct pan_kmod_vm_op vm_op = {
+@@ -92,12 +110,12 @@ panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
+    bo->ptr.gpu = vm_op.va.start;
+    bo->flags = flags;
+    bo->dev = dev;
++   simple_mtx_init(&bo->lock, mtx_plain);
+    return bo;
+ 
+ err_bind:
+    pan_kmod_bo_put(kmod_bo);
+-   /* BO will be freed with the sparse array, but zero to indicate free */
+-   memset(bo, 0, sizeof(*bo));
++   reset_bo_slot(bo);
+ err_alloc:
+    return NULL;
+ }
+@@ -111,8 +129,13 @@ panfrost_bo_free(struct panfrost_bo *bo)
+    struct pan_kmod_vm *vm = bo->dev->kmod.vm;
+    uint64_t gpu_va = bo->ptr.gpu;
+ 
++   /* reset_bo_slot() will undo the poisoning done in simple_mtx_destroy(), but
++    * we need it for the valgrind annotation.
++    */
++   simple_mtx_destroy(&bo->lock);
++
+    /* BO will be freed with the sparse array, but zero to indicate free */
+-   memset(bo, 0, sizeof(*bo));
++   reset_bo_slot(bo);
+ 
+    struct pan_kmod_vm_op vm_op = {
+       .type = PAN_KMOD_VM_OP_TYPE_UNMAP,
+@@ -130,42 +153,6 @@ panfrost_bo_free(struct panfrost_bo *bo)
+    pan_kmod_bo_put(kmod_bo);
+ }
+ 
+-/* Returns true if the BO is ready, false otherwise.
+- * access_type is encoding the type of access one wants to ensure is done.
+- * Waiting is always done for writers, but if wait_readers is set then readers
+- * are also waited for.
+- */
+-bool
+-panfrost_bo_wait(struct panfrost_bo *bo, int64_t timeout_ns, bool wait_readers)
+-{
+-   PAN_TRACE_FUNC(PAN_TRACE_GL_BO);
+-
+-   /* If the BO has been exported or imported we can't rely on the cached
+-    * state, we need to call the WAIT_BO ioctl.
+-    */
+-   if (!(bo->flags & PAN_BO_SHARED)) {
+-      /* If ->gpu_access is 0, the BO is idle, no need to wait. */
+-      if (!bo->gpu_access)
+-         return true;
+-
+-      /* If the caller only wants to wait for writers and no
+-       * writes are pending, we don't have to wait.
+-       */
+-      if (!wait_readers && !(bo->gpu_access & PAN_BO_ACCESS_WRITE))
+-         return true;
+-   }
+-
+-   if (pan_kmod_bo_wait(bo->kmod_bo, timeout_ns, !wait_readers)) {
+-      /* Set gpu_access to 0 so that the next call to bo_wait()
+-       * doesn't have to call the WAIT_BO ioctl.
+-       */
+-      bo->gpu_access = 0;
+-      return true;
+-   }
+-
+-   return false;
+-}
+-
+ /* Helper to calculate the bucket index of a BO */
+ 
+ static unsigned
+@@ -420,6 +407,7 @@ panfrost_bo_create(struct panfrost_device *dev, size_t size, uint32_t flags,
+    }
+ 
+    panfrost_bo_set_label(bo, label);
++   bo->seqno++;
+ 
+    return bo;
+ }
+@@ -551,8 +539,11 @@ panfrost_bo_export(struct panfrost_bo *bo)
+    PAN_TRACE_FUNC(PAN_TRACE_GL_BO);
+ 
+    int ret = pan_kmod_bo_export(bo->kmod_bo);
+-   if (ret >= 0)
++   if (ret >= 0) {
++      simple_mtx_lock(&bo->lock);
+       bo->flags |= PAN_BO_SHARED;
++      simple_mtx_unlock(&bo->lock);
++   }
+ 
+    return ret;
+ }
+@@ -574,6 +565,7 @@ const char *
+ panfrost_bo_replace_label(struct panfrost_bo *bo, const char *label,
+                           bool set_kernel_label)
+ {
++   simple_mtx_lock(&bo->lock);
+    const char *old_label = bo->label;
+ 
+    bo->label = label;
+@@ -581,5 +573,7 @@ panfrost_bo_replace_label(struct panfrost_bo *bo, const char *label,
+    if (set_kernel_label)
+       pan_kmod_set_bo_label(bo->dev->kmod.dev, bo->kmod_bo, label);
+ 
++   simple_mtx_unlock(&bo->lock);
++
+    return old_label;
+ }
+diff --git a/src/gallium/drivers/panfrost/pan_bo.h b/src/gallium/drivers/panfrost/pan_bo.h
+index 0372c05..050583c 100644
+--- a/src/gallium/drivers/panfrost/pan_bo.h
++++ b/src/gallium/drivers/panfrost/pan_bo.h
+@@ -13,6 +13,7 @@
+ #include "pan_pool.h"
+ 
+ #include "kmod/pan_kmod.h"
++#include "pan_trace.h"
+ 
+ /* Flags for allocated memory */
+ 
+@@ -38,26 +39,6 @@
+  * PAN_BO_SHARED if the BO has not been exported yet */
+ #define PAN_BO_SHAREABLE (1 << 5)
+ 
+-/* GPU access flags */
+-
+-/* BO is either shared (can be accessed by more than one GPU batch) or private
+- * (reserved by a specific GPU job). */
+-#define PAN_BO_ACCESS_PRIVATE (0 << 0)
+-#define PAN_BO_ACCESS_SHARED  (1 << 0)
+-
+-/* BO is being read/written by the GPU */
+-#define PAN_BO_ACCESS_READ  (1 << 1)
+-#define PAN_BO_ACCESS_WRITE (1 << 2)
+-#define PAN_BO_ACCESS_RW    (PAN_BO_ACCESS_READ | PAN_BO_ACCESS_WRITE)
+-
+-/* BO is accessed by the vertex/tiler job. */
+-#define PAN_BO_ACCESS_VERTEX_TILER (1 << 3)
+-
+-/* BO is accessed by the fragment job. */
+-#define PAN_BO_ACCESS_FRAGMENT (1 << 4)
+-
+-typedef uint8_t pan_bo_access;
+-
+ struct panfrost_device;
+ 
+ struct panfrost_bo {
+@@ -85,17 +66,20 @@ struct panfrost_bo {
+ 
+    uint32_t flags;
+ 
+-   /* Combination of PAN_BO_ACCESS_{READ,WRITE} flags encoding pending
+-    * GPU accesses to this BO. Useful to avoid calling the WAIT_BO ioctl
+-    * when the BO is idle.
++   /* Sequence number that gets incremented every time a BO is allocated.
++    * Used to identify stale data in the per-BO access tracking done at the
++    * panfrost_context level.
+     */
+-   uint32_t gpu_access;
++   uint32_t seqno;
+ 
+    /* Driver-provided human-readable description of the BO for debugging.
+     * Consists of a BO name and optional additional information, like
+     * pixel format or buffer modifiers.
+     */
+    const char *label;
++
++   /* Lock used to protect concurrent access to flags and label. */
++   simple_mtx_t lock;
+ };
+ 
+ static inline size_t
+@@ -113,8 +97,19 @@ panfrost_bo_handle(struct panfrost_bo *bo)
+ struct panfrost_bo *panfrost_bo_from_kmod_bo(struct panfrost_device *dev,
+                                              struct pan_kmod_bo *kmod_bo);
+ 
+-bool panfrost_bo_wait(struct panfrost_bo *bo, int64_t timeout_ns,
+-                      bool wait_readers);
++/* Returns true if the BO is ready, false otherwise.
++ * access_type is encoding the type of access one wants to ensure is done.
++ * Waiting is always done for writers, but if wait_readers is set then readers
++ * are also waited for.
++ */
++static inline bool
++panfrost_bo_wait(struct panfrost_bo *bo, int64_t timeout_ns, bool wait_readers)
++{
++   PAN_TRACE_FUNC(PAN_TRACE_GL_BO);
++
++   return pan_kmod_bo_wait(bo->kmod_bo, timeout_ns, !wait_readers);
++}
++
+ void panfrost_bo_reference(struct panfrost_bo *bo);
+ void panfrost_bo_unreference(struct panfrost_bo *bo);
+ struct panfrost_bo *panfrost_bo_create(struct panfrost_device *dev, size_t size,
+diff --git a/src/gallium/drivers/panfrost/pan_cmdstream.c b/src/gallium/drivers/panfrost/pan_cmdstream.c
+index bcb3abe..3a77533 100644
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -433,8 +433,8 @@ panfrost_emit_compute_shader_meta(struct panfrost_batch *batch,
+ {
+    struct panfrost_compiled_shader *ss = batch->ctx->prog[stage];
+ 
+-   panfrost_batch_add_bo(batch, ss->bin.bo, MESA_SHADER_VERTEX);
+-   panfrost_batch_add_bo(batch, ss->state.bo, MESA_SHADER_VERTEX);
++   panfrost_batch_add_bo(batch, ss->bin.bo);
++   panfrost_batch_add_bo(batch, ss->state.bo);
+ 
+    return ss->state.gpu;
+ }
+@@ -673,8 +673,8 @@ panfrost_emit_frag_shader_meta(struct panfrost_batch *batch)
+    struct panfrost_context *ctx = batch->ctx;
+    struct panfrost_compiled_shader *ss = ctx->prog[MESA_SHADER_FRAGMENT];
+ 
+-   panfrost_batch_add_bo(batch, ss->bin.bo, MESA_SHADER_FRAGMENT);
+-   panfrost_batch_add_bo(batch, ss->state.bo, MESA_SHADER_FRAGMENT);
++   panfrost_batch_add_bo(batch, ss->bin.bo);
++   panfrost_batch_add_bo(batch, ss->state.bo);
+ 
+    struct pan_ptr xfer;
+ 
+@@ -958,7 +958,7 @@ panfrost_emit_vertex_buffers(struct panfrost_batch *batch)
+       struct panfrost_resource *rsrc = pan_resource(prsrc);
+       assert(!vb.is_user_buffer);
+ 
+-      panfrost_batch_read_rsrc(batch, rsrc, MESA_SHADER_VERTEX);
++      panfrost_batch_read_rsrc(batch, rsrc);
+ 
+       pan_pack(buffers + i, BUFFER, cfg) {
+          cfg.address = rsrc->plane.base + vb.buffer_offset;
+@@ -1017,7 +1017,7 @@ panfrost_emit_images(struct panfrost_batch *batch, mesa_shader_stage stage)
+       panfrost_update_sampler_view(&view, &ctx->base);
+       out[i] = view.bifrost_tex_descriptor;
+ 
+-      panfrost_track_image_access(batch, stage, image);
++      panfrost_track_image_access(batch, image);
+    }
+ 
+    return T.gpu;
+@@ -1026,7 +1026,6 @@ panfrost_emit_images(struct panfrost_batch *batch, mesa_shader_stage stage)
+ 
+ static uint64_t
+ panfrost_map_constant_buffer_gpu(struct panfrost_batch *batch,
+-                                 mesa_shader_stage st,
+                                  struct panfrost_constant_buffer *buf,
+                                  unsigned index)
+ {
+@@ -1034,7 +1033,7 @@ panfrost_map_constant_buffer_gpu(struct panfrost_batch *batch,
+    struct panfrost_resource *rsrc = pan_resource(cb->buffer);
+ 
+    if (rsrc) {
+-      panfrost_batch_read_rsrc(batch, rsrc, st);
++      panfrost_batch_read_rsrc(batch, rsrc);
+ 
+       /* Alignment gauranteed by
+        * pipe_caps.constant_buffer_offset_alignment */
+@@ -1190,7 +1189,7 @@ panfrost_upload_ssbo_sysval(struct panfrost_batch *batch,
+    struct panfrost_resource *rsrc = pan_resource(sb.buffer);
+    struct panfrost_bo *bo = rsrc->bo;
+ 
+-   panfrost_batch_write_rsrc(batch, rsrc, st);
++   panfrost_batch_write_rsrc(batch, rsrc);
+ 
+    util_range_add(&rsrc->base, &rsrc->valid_buffer_range, sb.buffer_offset,
+                   sb.buffer_size);
+@@ -1362,7 +1361,7 @@ panfrost_upload_sysvals(struct panfrost_batch *batch, void *ptr_cpu,
+          util_range_add(&rsrc->base, &rsrc->valid_buffer_range, offset,
+                         target->buffer_size - offset);
+ 
+-         panfrost_batch_write_rsrc(batch, rsrc, MESA_SHADER_VERTEX);
++         panfrost_batch_write_rsrc(batch, rsrc);
+ 
+          uniforms[i].du[0] = rsrc->plane.base + offset;
+          break;
+@@ -1479,7 +1478,7 @@ panfrost_emit_ssbos(struct panfrost_batch *batch, mesa_shader_stage st)
+       struct panfrost_resource *rsrc = pan_resource(sb.buffer);
+       struct panfrost_bo *bo = rsrc->bo;
+ 
+-      panfrost_batch_write_rsrc(batch, rsrc, st);
++      panfrost_batch_write_rsrc(batch, rsrc);
+ 
+       util_range_add(&rsrc->base, &rsrc->valid_buffer_range, sb.buffer_offset,
+                      sb.buffer_size);
+@@ -1571,7 +1570,7 @@ panfrost_emit_const_buf(struct panfrost_batch *batch,
+ 
+       if (usz > 0) {
+          address =
+-            panfrost_map_constant_buffer_gpu(batch, stage, buf, ubo_adj);
++            panfrost_map_constant_buffer_gpu(batch, buf, ubo_adj);
+       }
+ 
+       panfrost_emit_ubo(ubos.cpu, ubo, address, usz);
+@@ -1701,7 +1700,7 @@ panfrost_emit_shared_memory(struct panfrost_batch *batch,
+ 
+ #if PAN_ARCH <= 5
+ static uint64_t
+-panfrost_get_tex_desc(struct panfrost_batch *batch, mesa_shader_stage st,
++panfrost_get_tex_desc(struct panfrost_batch *batch,
+                       struct panfrost_sampler_view *view)
+ {
+    if (!view)
+@@ -1710,8 +1709,8 @@ panfrost_get_tex_desc(struct panfrost_batch *batch, mesa_shader_stage st,
+    struct pipe_sampler_view *pview = &view->base;
+    struct panfrost_resource *rsrc = pan_resource(pview->texture);
+ 
+-   panfrost_batch_read_rsrc(batch, rsrc, st);
+-   panfrost_batch_add_bo(batch, view->state.bo, st);
++   panfrost_batch_read_rsrc(batch, rsrc);
++   panfrost_batch_add_bo(batch, view->state.bo);
+ 
+    return view->state.gpu;
+ }
+@@ -1977,8 +1976,8 @@ panfrost_emit_texture_descriptors(struct panfrost_batch *batch,
+       out[i] = view->bifrost_tex_descriptor;
+ #endif
+ 
+-      panfrost_batch_read_rsrc(batch, rsrc, stage);
+-      panfrost_batch_add_bo(batch, view->state.bo, stage);
++      panfrost_batch_read_rsrc(batch, rsrc);
++      panfrost_batch_add_bo(batch, view->state.bo);
+    }
+ 
+    for (int i = actual_count; i < needed_count; ++i)
+@@ -1998,7 +1997,7 @@ panfrost_emit_texture_descriptors(struct panfrost_batch *batch,
+ 
+       panfrost_update_sampler_view(view, &ctx->base);
+ 
+-      trampolines[i] = panfrost_get_tex_desc(batch, stage, view);
++      trampolines[i] = panfrost_get_tex_desc(batch, view);
+    }
+ 
+    for (int i = actual_count; i < needed_count; ++i)
+@@ -2152,7 +2151,7 @@ emit_image_bufs(struct panfrost_batch *batch, mesa_shader_stage shader,
+                                      : layout->array_stride_B));
+       }
+ 
+-      panfrost_track_image_access(batch, shader, image);
++      panfrost_track_image_access(batch, image);
+ 
+ #if PAN_ARCH >= 6
+       if (is_buffer) {
+@@ -2382,7 +2381,7 @@ panfrost_emit_vertex_data(struct panfrost_batch *batch, uint64_t *buffers)
+       if (!rsrc)
+          continue;
+ 
+-      panfrost_batch_read_rsrc(batch, rsrc, MESA_SHADER_VERTEX);
++      panfrost_batch_read_rsrc(batch, rsrc);
+ 
+       /* Mask off lower bits, see offset fixup below */
+       uint64_t raw_addr = rsrc->plane.base + buf->buffer_offset;
+@@ -3583,8 +3582,7 @@ panfrost_draw_indirect(struct pipe_context *pipe,
+ 
+    struct pipe_draw_info tmp_info = *info;
+ 
+-   panfrost_batch_read_rsrc(batch, pan_resource(indirect->buffer),
+-                            MESA_SHADER_VERTEX);
++   panfrost_batch_read_rsrc(batch, pan_resource(indirect->buffer));
+ 
+    panfrost_update_active_prim(ctx, &tmp_info);
+ 
+@@ -3594,7 +3592,7 @@ panfrost_draw_indirect(struct pipe_context *pipe,
+    if (info->index_size) {
+       struct panfrost_resource *index_buffer =
+          pan_resource(info->index.resource);
+-      panfrost_batch_read_rsrc(batch, index_buffer, MESA_SHADER_VERTEX);
++      panfrost_batch_read_rsrc(batch, index_buffer);
+       batch->indices = index_buffer->plane.base;
+    }
+ 
+@@ -3691,7 +3689,7 @@ panfrost_launch_grid_on_batch(struct pipe_context *pipe,
+          continue;
+ 
+       struct panfrost_resource *buffer = pan_resource(*res);
+-      panfrost_batch_write_rsrc(batch, buffer, MESA_SHADER_COMPUTE);
++      panfrost_batch_write_rsrc(batch, buffer);
+    }
+ 
+    if (info->indirect && !PAN_GPU_SUPPORTS_DISPATCH_INDIRECT) {
+@@ -3729,7 +3727,7 @@ panfrost_launch_grid_on_batch(struct pipe_context *pipe,
+ 
+    /* if indirect, mark the indirect buffer as being read */
+    if (info->indirect)
+-      panfrost_batch_read_rsrc(batch, pan_resource(info->indirect), MESA_SHADER_COMPUTE);
++      panfrost_batch_read_rsrc(batch, pan_resource(info->indirect));
+ 
+    /* launch it */
+ #if PAN_ARCH >= 10
+@@ -3847,8 +3845,8 @@ panfrost_afbc_size(struct panfrost_batch *batch, struct panfrost_resource *src,
+                      src->image.props.modifier,
+                      u_minify(src->image.props.extent_px.height, level));
+ 
+-   panfrost_batch_read_rsrc(batch, src, MESA_SHADER_COMPUTE);
+-   panfrost_batch_write_bo(batch, layout, MESA_SHADER_COMPUTE);
++   panfrost_batch_read_rsrc(batch, src);
++   panfrost_batch_write_bo(batch, layout);
+ 
+    LAUNCH_AFBC_CONV_SHADER(size, batch, src, consts, nr_sblocks);
+ }
+@@ -3883,9 +3881,9 @@ panfrost_afbc_pack(struct panfrost_batch *batch, struct panfrost_resource *src,
+       .dst_stride = dst_stride_sb,
+    };
+ 
+-   panfrost_batch_read_rsrc(batch, src, MESA_SHADER_COMPUTE);
+-   panfrost_batch_write_bo(batch, dst, MESA_SHADER_COMPUTE);
+-   panfrost_batch_add_bo(batch, layout, MESA_SHADER_COMPUTE);
++   panfrost_batch_read_rsrc(batch, src);
++   panfrost_batch_write_bo(batch, dst);
++   panfrost_batch_add_bo(batch, layout);
+ 
+    LAUNCH_AFBC_CONV_SHADER(pack, batch, src, consts, nr_sblocks);
+ }
+@@ -4621,8 +4619,7 @@ batch_get_polygon_list(struct panfrost_batch *batch)
+       }
+ 
+       batch->tiler_ctx.midgard.polygon_list = batch->polygon_list_bo->ptr.gpu;
+-      panfrost_batch_add_bo(batch, batch->polygon_list_bo,
+-                            MESA_SHADER_FRAGMENT);
++      panfrost_batch_add_bo(batch, batch->polygon_list_bo);
+ 
+       if (init_polygon_list && dev->model->quirks.no_hierarchical_tiling) {
+          assert(batch->polygon_list_bo->ptr.cpu);
+diff --git a/src/gallium/drivers/panfrost/pan_context.c b/src/gallium/drivers/panfrost/pan_context.c
+index f8425d4..199fccc 100644
+--- a/src/gallium/drivers/panfrost/pan_context.c
++++ b/src/gallium/drivers/panfrost/pan_context.c
+@@ -586,10 +586,11 @@ static const void *
+ panfrost_trace_get_data(struct u_trace_context *utctx, void *buffer,
+                         uint64_t offset_B, uint32_t size_B)
+ {
++   struct panfrost_context *ctx = pan_context((struct pipe_context *)utctx->pctx);
+    struct panfrost_resource *rsrc =
+       pan_resource((struct pipe_resource *)buffer);
+ 
+-   panfrost_bo_wait(rsrc->bo, INT64_MAX, false);
++   panfrost_resource_wait(rsrc, ctx, INT64_MAX, false);
+ 
+    if (panfrost_bo_mmap(rsrc->bo))
+       return NULL;
+@@ -609,7 +610,7 @@ panfrost_trace_read_ts(struct u_trace_context *utctx, void *timestamps,
+    if (!dev->kmod.dev->props.timestamp_frequency)
+       return U_TRACE_NO_TIMESTAMP;
+ 
+-   panfrost_bo_wait(rsrc->bo, INT64_MAX, false);
++   panfrost_resource_wait(rsrc, ctx, INT64_MAX, false);
+ 
+    if (panfrost_bo_mmap(rsrc->bo))
+       return U_TRACE_NO_TIMESTAMP;
+@@ -850,7 +851,7 @@ panfrost_get_query_result(struct pipe_context *pipe, struct pipe_query *q,
+    case PIPE_QUERY_OCCLUSION_PREDICATE:
+    case PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE:
+       panfrost_flush_writer(ctx, rsrc, "Occlusion query");
+-      panfrost_bo_wait(rsrc->bo, INT64_MAX, false);
++      panfrost_resource_wait(rsrc, ctx, INT64_MAX, false);
+ 
+       /* Read back the query results */
+       uint64_t *result = (uint64_t *)rsrc->bo->ptr.cpu;
+@@ -872,7 +873,7 @@ panfrost_get_query_result(struct pipe_context *pipe, struct pipe_query *q,
+ 
+    case PIPE_QUERY_TIMESTAMP: {
+       panfrost_flush_writer(ctx, rsrc, "Timestamp query");
+-      panfrost_bo_wait(rsrc->bo, INT64_MAX, false);
++      panfrost_resource_wait(rsrc, ctx, INT64_MAX, false);
+       uint64_t *timestamp = (uint64_t *)rsrc->bo->ptr.cpu;
+ 
+       vresult->u64 = pan_gpu_time_to_ns(dev, *timestamp);
+@@ -888,7 +889,7 @@ panfrost_get_query_result(struct pipe_context *pipe, struct pipe_query *q,
+ 
+    case PIPE_QUERY_TIME_ELAPSED: {
+       panfrost_flush_writer(ctx, rsrc, "Time elapsed query");
+-      panfrost_bo_wait(rsrc->bo, INT64_MAX, false);
++      panfrost_resource_wait(rsrc, ctx, INT64_MAX, false);
+       uint64_t *timestamp = (uint64_t *)rsrc->bo->ptr.cpu;
+ 
+       vresult->u64 = pan_gpu_time_to_ns(dev, timestamp[1] - timestamp[0]);
+@@ -1210,6 +1211,7 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
+    ctx->sample_mask = ~0;
+    ctx->active_queries = true;
+ 
++   util_dynarray_init(&ctx->bo_access, ctx);
+    util_dynarray_init(&ctx->global_buffers, ctx);
+ 
+    /* Sync object/FD used for NATIVE_FENCE_FD. */
+diff --git a/src/gallium/drivers/panfrost/pan_context.h b/src/gallium/drivers/panfrost/pan_context.h
+index 651bce3..3594913 100644
+--- a/src/gallium/drivers/panfrost/pan_context.h
++++ b/src/gallium/drivers/panfrost/pan_context.h
+@@ -25,6 +25,7 @@
+ #include "util/format/u_formats.h"
+ #include "util/hash_table.h"
+ #include "util/simple_mtx.h"
++#include "util/u_dynarray.h"
+ #include "util/u_blitter.h"
+ #include "util/u_printf.h"
+ 
+@@ -251,6 +252,16 @@ struct panfrost_context {
+    struct panfrost_perfetto_state perfetto;
+ #endif
+    uint32_t submit_count; /* monotonic submit ID for perfetto */
++
++   /* Used to track in-flight BO accesses done by this context (job
++    * accessing those BOs have been submitted, but we don't know if
++    * they completed yet).
++    * The array is indexed by BO handles and is never shrunk.
++    * Each uint32_t entry encodes the pending access type (R/W) and the
++    * BO seqno at the time of this access. The seqno allows us to
++    * detect stale entries when a BO or its handle is recycled.
++    */
++   struct util_dynarray bo_access;
+ };
+ 
+ /* Corresponds to the CSO */
+@@ -584,9 +595,57 @@ void panfrost_set_batch_masks_blend(struct panfrost_batch *batch);
+ void panfrost_set_batch_masks_zs(struct panfrost_batch *batch);
+ 
+ void panfrost_track_image_access(struct panfrost_batch *batch,
+-                                 mesa_shader_stage stage,
+                                  struct pipe_image_view *image);
+ 
+ void panfrost_context_reinit(struct panfrost_context *ctx);
+ 
++static inline void
++panfrost_context_report_bo_access(struct panfrost_context *ctx,
++                                  struct panfrost_bo *bo, uint32_t access)
++{
++   /* Skip if per-context tracking is not requested or if the BO is shared. */
++   if (!(access & PAN_BO_ACCESS_PER_CTX_TRACKING || (bo->flags & PAN_BO_SHARED)))
++      return;
++
++   ASSERTED void *new_bo_access;
++   uint32_t handle = panfrost_bo_handle(bo);
++
++   new_bo_access = util_dynarray_resize_zero(&ctx->bo_access, uint32_t, handle + 1);
++   if (!new_bo_access)
++      return;
++
++   uint32_t *access_ptr = util_dynarray_element(&ctx->bo_access, uint32_t, handle);
++   uint32_t seqno = *access_ptr >> 2;
++   uint32_t pending = *access_ptr & BITFIELD_MASK(2);
++
++   static_assert(PAN_BO_ACCESS_RW == BITFIELD_MASK(2),
++                 "PAN_BO_ACCESS_RW expected to cover the lower 2-bits");
++
++   access &= PAN_BO_ACCESS_RW;
++
++   /* We don't have an easy way to know when the BO leaves the context,
++    * nor do we have a way to get back to contexts that might have been
++    * using the BO when the resource is destroyed. This means we're left
++    * with potential stale data in the bo_access array, which we check
++    * validity of based on a per-BO seqno that gets incremented every
++    * time a BO is allocated (handle re-allocated, or BO taken from the
++    * BO cache, which forces a wait-on-everything). If that happens,
++    * the pending accesses are reset, and the seqno gets updated to match
++    * the BO seqno.
++    */
++   if (seqno != bo->seqno)
++      seqno = bo->seqno;
++   else
++      access |= pending;
++
++   /* We lose the 2 MSB of the seqno here, but 30 bits should be more
++    * than enough to prevent spurious wrap around messing up with the
++    * stale entry detection. Worst case scenario, we really have 2^30
++    * rotations on this handle, and we wrongly consider the entry valid
++    * and wait when we could have skipped the wait => that's not the end
++    * of the world.
++    */
++   *access_ptr = (seqno << 2) | access;
++}
++
+ #endif
+diff --git a/src/gallium/drivers/panfrost/pan_csf.c b/src/gallium/drivers/panfrost/pan_csf.c
+index d232b63..f831e4b 100644
+--- a/src/gallium/drivers/panfrost/pan_csf.c
++++ b/src/gallium/drivers/panfrost/pan_csf.c
+@@ -627,13 +627,6 @@ csf_submit_collect_wait_ops(struct panfrost_batch *batch,
+       if (!flags)
+          continue;
+ 
+-      /* Update the BO access flags so that panfrost_bo_wait() knows
+-       * about all pending accesses.
+-       * We only keep the READ/WRITE info since this is all the BO
+-       * wait logic cares about.
+-       * We also preserve existing flags as this batch might not
+-       * be the first one to access the BO.
+-       */
+       struct panfrost_bo *bo = pan_lookup_bo(dev, i);
+ 
+       ret = panthor_kmod_bo_get_sync_point(bo->kmod_bo, &bo_sync_handle,
+@@ -708,7 +701,6 @@ csf_attach_sync_points(struct panfrost_batch *batch, uint32_t vm_sync_handle,
+     * be written by the GPU to keep things simple.
+     */
+    util_dynarray_foreach(&batch->pool.bos, struct panfrost_bo *, bo) {
+-      (*bo)->gpu_access |= PAN_BO_ACCESS_RW;
+       ret = panthor_kmod_bo_attach_sync_point((*bo)->kmod_bo, vm_sync_handle,
+                                               vm_sync_signal_point, true);
+       if (ret)
+@@ -717,7 +709,6 @@ csf_attach_sync_points(struct panfrost_batch *batch, uint32_t vm_sync_handle,
+ 
+    util_dynarray_foreach(&batch->csf.cs_chunk_pool.bos, struct panfrost_bo *,
+                          bo) {
+-      (*bo)->gpu_access |= PAN_BO_ACCESS_RW;
+       ret = panthor_kmod_bo_attach_sync_point((*bo)->kmod_bo, vm_sync_handle,
+                                               vm_sync_signal_point, true);
+       if (ret)
+@@ -734,7 +725,7 @@ csf_attach_sync_points(struct panfrost_batch *batch, uint32_t vm_sync_handle,
+ 
+       struct panfrost_bo *bo = pan_lookup_bo(dev, i);
+ 
+-      bo->gpu_access |= flags & (PAN_BO_ACCESS_RW);
++      panfrost_context_report_bo_access(ctx, bo, flags);
+       ret = panthor_kmod_bo_attach_sync_point(bo->kmod_bo, vm_sync_handle,
+                                               vm_sync_signal_point,
+                                               flags & PAN_BO_ACCESS_WRITE);
+@@ -1500,7 +1491,7 @@ csf_emit_draw_state(struct panfrost_batch *batch,
+    if (panfrost_occlusion_query_active(ctx)) {
+       struct panfrost_resource *rsrc = pan_resource(ctx->occlusion_query->rsrc);
+       cs_move64_to(b, cs_sr_reg64(b, IDVS, OQ), rsrc->plane.base);
+-      panfrost_batch_write_rsrc(ctx->batch, rsrc, MESA_SHADER_FRAGMENT);
++      panfrost_batch_write_rsrc(ctx->batch, rsrc);
+    }
+ 
+    cs_move32_to(b, cs_sr_reg32(b, IDVS, VARY_SIZE),
+@@ -2043,7 +2034,7 @@ GENX(csf_emit_write_timestamp)(struct panfrost_batch *batch,
+       : cs_now();
+    cs_store_state(b, address, 0, MALI_CS_STATE_TIMESTAMP, async);
+ 
+-   panfrost_batch_write_rsrc(batch, dst, MESA_SHADER_VERTEX);
++   panfrost_batch_write_rsrc(batch, dst);
+ }
+ 
+ void
+@@ -2073,5 +2064,5 @@ GENX(csf_emit_copy_data)(struct panfrost_batch *batch,
+    cs_wait_slot(b, 0);
+    cs_store(b, data, dst_addr, BITFIELD_MASK(count), 0);
+ 
+-   panfrost_batch_write_rsrc(batch, dst, MESA_SHADER_VERTEX);
++   panfrost_batch_write_rsrc(batch, dst);
+ }
+diff --git a/src/gallium/drivers/panfrost/pan_helpers.c b/src/gallium/drivers/panfrost/pan_helpers.c
+index 99012fd..f21b20e 100644
+--- a/src/gallium/drivers/panfrost/pan_helpers.c
++++ b/src/gallium/drivers/panfrost/pan_helpers.c
+@@ -87,7 +87,7 @@ panfrost_get_index_buffer(struct panfrost_batch *batch,
+ 
+    if (!info->has_user_indices) {
+       /* Only resources can be directly mapped */
+-      panfrost_batch_read_rsrc(batch, rsrc, MESA_SHADER_VERTEX);
++      panfrost_batch_read_rsrc(batch, rsrc);
+       return rsrc->plane.base + offset;
+    } else {
+       /* Otherwise, we need to upload to transient memory */
+@@ -225,13 +225,12 @@ panfrost_set_batch_masks_zs(struct panfrost_batch *batch)
+ 
+ void
+ panfrost_track_image_access(struct panfrost_batch *batch,
+-                            mesa_shader_stage stage,
+                             struct pipe_image_view *image)
+ {
+    struct panfrost_resource *rsrc = pan_resource(image->resource);
+ 
+    if (image->shader_access & PIPE_IMAGE_ACCESS_WRITE) {
+-      panfrost_batch_write_rsrc(batch, rsrc, stage);
++      panfrost_batch_write_rsrc(batch, rsrc);
+ 
+       bool is_buffer = rsrc->base.target == PIPE_BUFFER;
+       unsigned level = is_buffer ? 0 : image->u.tex.level;
+@@ -242,6 +241,6 @@ panfrost_track_image_access(struct panfrost_batch *batch,
+                         rsrc->base.width0);
+       }
+    } else {
+-      panfrost_batch_read_rsrc(batch, rsrc, stage);
++      panfrost_batch_read_rsrc(batch, rsrc);
+    }
+ }
+diff --git a/src/gallium/drivers/panfrost/pan_jm.c b/src/gallium/drivers/panfrost/pan_jm.c
+index 57ba7b3..5142a2d 100644
+--- a/src/gallium/drivers/panfrost/pan_jm.c
++++ b/src/gallium/drivers/panfrost/pan_jm.c
+@@ -117,17 +117,7 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
+ 
+       assert(submit.bo_handle_count < batch->num_bos);
+       bo_handles[submit.bo_handle_count++] = i;
+-
+-      /* Update the BO access flags so that panfrost_bo_wait() knows
+-       * about all pending accesses.
+-       * We only keep the READ/WRITE info since this is all the BO
+-       * wait logic cares about.
+-       * We also preserve existing flags as this batch might not
+-       * be the first one to access the BO.
+-       */
+-      struct panfrost_bo *bo = pan_lookup_bo(dev, i);
+-
+-      bo->gpu_access |= flags[i] & (PAN_BO_ACCESS_RW);
++      panfrost_context_report_bo_access(ctx, pan_lookup_bo(dev, i), flags[i]);
+    }
+ 
+    panfrost_pool_get_bo_handles(&batch->pool,
+@@ -553,7 +543,7 @@ jm_emit_tiler_draw(struct mali_draw_packed *out, struct panfrost_batch *batch,
+          struct panfrost_resource *rsrc =
+             pan_resource(ctx->occlusion_query->rsrc);
+          cfg.occlusion = rsrc->plane.base;
+-         panfrost_batch_write_rsrc(ctx->batch, rsrc, MESA_SHADER_FRAGMENT);
++         panfrost_batch_write_rsrc(ctx->batch, rsrc);
+       }
+ 
+ #if PAN_ARCH >= 9
+@@ -1050,7 +1040,7 @@ GENX(jm_emit_write_timestamp)(struct panfrost_batch *batch,
+ 
+    pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_WRITE_VALUE, false,
+                   false, 0, 0, &job, false);
+-   panfrost_batch_write_rsrc(batch, dst, MESA_SHADER_VERTEX);
++   panfrost_batch_write_rsrc(batch, dst);
+ }
+ 
+ int
+diff --git a/src/gallium/drivers/panfrost/pan_job.c b/src/gallium/drivers/panfrost/pan_job.c
+index bfe1f9d..a96d02a 100644
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -48,7 +48,7 @@ panfrost_batch_add_surface(struct panfrost_batch *batch,
+    if (surf->texture) {
+       struct panfrost_resource *rsrc = pan_resource(surf->texture);
+       pan_legalize_format(batch->ctx, rsrc, surf->format, true, false);
+-      panfrost_batch_write_rsrc(batch, rsrc, MESA_SHADER_FRAGMENT);
++      panfrost_batch_write_rsrc(batch, rsrc);
+    }
+ }
+ 
+@@ -335,35 +335,29 @@ panfrost_batch_add_bo_old(struct panfrost_batch *batch, struct panfrost_bo *bo,
+    *entry = flags;
+ }
+ 
+-static uint32_t
+-panfrost_access_for_stage(mesa_shader_stage stage)
+-{
+-   return (stage == MESA_SHADER_FRAGMENT) ? PAN_BO_ACCESS_FRAGMENT
+-                                          : PAN_BO_ACCESS_VERTEX_TILER;
+-}
+-
+ void
+-panfrost_batch_add_bo(struct panfrost_batch *batch, struct panfrost_bo *bo,
+-                      mesa_shader_stage stage)
++panfrost_batch_add_bo(struct panfrost_batch *batch, struct panfrost_bo *bo)
+ {
+-   panfrost_batch_add_bo_old(
+-      batch, bo, PAN_BO_ACCESS_READ | panfrost_access_for_stage(stage));
++   panfrost_batch_add_bo_old(batch, bo, PAN_BO_ACCESS_READ);
+ }
+ 
+ void
+-panfrost_batch_write_bo(struct panfrost_batch *batch, struct panfrost_bo *bo,
+-                        mesa_shader_stage stage)
++panfrost_batch_write_bo(struct panfrost_batch *batch, struct panfrost_bo *bo)
+ {
+-   panfrost_batch_add_bo_old(
+-      batch, bo, PAN_BO_ACCESS_WRITE | panfrost_access_for_stage(stage));
++   panfrost_batch_add_bo_old(batch, bo, PAN_BO_ACCESS_WRITE);
+ }
+ 
+ void
+ panfrost_batch_read_rsrc(struct panfrost_batch *batch,
+-                         struct panfrost_resource *rsrc,
+-                         mesa_shader_stage stage)
++                         struct panfrost_resource *rsrc)
+ {
+-   uint32_t access = PAN_BO_ACCESS_READ | panfrost_access_for_stage(stage);
++   /* Recursive call to panfrost_batch_read_rsrc() to add all planes.
++    * The max recursion depth should be 3.
++    */
++   if (rsrc->base.next)
++      panfrost_batch_read_rsrc(batch, pan_resource(rsrc->base.next));
++
++   uint32_t access = PAN_BO_ACCESS_READ | PAN_BO_ACCESS_PER_CTX_TRACKING;
+ 
+    pan_resource_update_access(batch->ctx, rsrc, false);
+ 
+@@ -379,10 +373,15 @@ panfrost_batch_read_rsrc(struct panfrost_batch *batch,
+ 
+ void
+ panfrost_batch_write_rsrc(struct panfrost_batch *batch,
+-                          struct panfrost_resource *rsrc,
+-                          mesa_shader_stage stage)
++                          struct panfrost_resource *rsrc)
+ {
+-   uint32_t access = PAN_BO_ACCESS_WRITE | panfrost_access_for_stage(stage);
++   /* Recursive call to panfrost_batch_write_rsrc() to add all planes.
++    * The max recursion depth should be 3.
++    */
++   if (rsrc->base.next)
++      panfrost_batch_write_rsrc(batch, pan_resource(rsrc->base.next));
++
++   uint32_t access = PAN_BO_ACCESS_WRITE | PAN_BO_ACCESS_PER_CTX_TRACKING;
+ 
+    pan_resource_update_access(batch->ctx, rsrc, true);
+ 
+@@ -406,7 +405,7 @@ panfrost_batch_create_bo(struct panfrost_batch *batch, size_t size,
+    bo = panfrost_bo_create(pan_device(batch->ctx->base.screen), size,
+                            create_flags, label);
+    if (bo) {
+-      panfrost_batch_add_bo(batch, bo, stage);
++      panfrost_batch_add_bo(batch, bo);
+ 
+       /* panfrost_batch_add_bo() has retained a reference and
+        * panfrost_bo_create() initialize the refcnt to 1, so let's
+@@ -434,7 +433,7 @@ panfrost_batch_get_scratchpad(struct panfrost_batch *batch,
+                                   MESA_SHADER_VERTEX, "Thread local storage");
+ 
+       if (batch->scratchpad)
+-         panfrost_batch_add_bo(batch, batch->scratchpad, MESA_SHADER_FRAGMENT);
++         panfrost_batch_add_bo(batch, batch->scratchpad);
+    }
+ 
+    return batch->scratchpad;
+diff --git a/src/gallium/drivers/panfrost/pan_job.h b/src/gallium/drivers/panfrost/pan_job.h
+index 60a081d..806b6ea 100644
+--- a/src/gallium/drivers/panfrost/pan_job.h
++++ b/src/gallium/drivers/panfrost/pan_job.h
+@@ -17,6 +17,18 @@
+ #include "pan_resource.h"
+ #include "util/perf/u_trace.h"
+ 
++/* BO is being read/written by the GPU */
++#define PAN_BO_ACCESS_READ  BITFIELD_BIT(0)
++#define PAN_BO_ACCESS_WRITE BITFIELD_BIT(1)
++#define PAN_BO_ACCESS_RW    (PAN_BO_ACCESS_READ | PAN_BO_ACCESS_WRITE)
++
++/* Set when the BO access needs to be recorded to the
++ * panfrost_context::bo_access array at submission time.
++ */
++#define PAN_BO_ACCESS_PER_CTX_TRACKING BITFIELD_BIT(2)
++
++typedef uint8_t pan_bo_access;
++
+ /* A panfrost_batch corresponds to a bound FBO we're rendering to,
+  * collecting over multiple draws. */
+ 
+@@ -187,20 +199,16 @@ struct panfrost_batch *
+ panfrost_get_fresh_batch_for_fbo(struct panfrost_context *ctx,
+                                  const char *reason);
+ 
+-void panfrost_batch_add_bo(struct panfrost_batch *batch, struct panfrost_bo *bo,
+-                           mesa_shader_stage stage);
++void panfrost_batch_add_bo(struct panfrost_batch *batch, struct panfrost_bo *bo);
+ 
+ void panfrost_batch_write_bo(struct panfrost_batch *batch,
+-                             struct panfrost_bo *bo,
+-                             mesa_shader_stage stage);
++                             struct panfrost_bo *bo);
+ 
+ void panfrost_batch_read_rsrc(struct panfrost_batch *batch,
+-                              struct panfrost_resource *rsrc,
+-                              mesa_shader_stage stage);
++                              struct panfrost_resource *rsrc);
+ 
+ void panfrost_batch_write_rsrc(struct panfrost_batch *batch,
+-                               struct panfrost_resource *rsrc,
+-                               mesa_shader_stage stage);
++                               struct panfrost_resource *rsrc);
+ 
+ bool panfrost_any_batch_reads_rsrc(struct panfrost_context *ctx,
+                                    struct panfrost_resource *rsrc);
+diff --git a/src/gallium/drivers/panfrost/pan_mempool.c b/src/gallium/drivers/panfrost/pan_mempool.c
+index 1c90261..fbdd1bb 100644
+--- a/src/gallium/drivers/panfrost/pan_mempool.c
++++ b/src/gallium/drivers/panfrost/pan_mempool.c
+@@ -7,6 +7,7 @@
+ #include <unistd.h>
+ #include <sys/mman.h>
+ 
++#include "pan_context.h"
+ #include "pan_device.h"
+ #include "pan_mempool.h"
+ #include "pan_trace.h"
+@@ -102,17 +103,10 @@ panfrost_pool_get_bo_handles(struct panfrost_pool *pool, uint32_t *handles)
+ 
+    unsigned idx = 0;
+    util_dynarray_foreach(&pool->bos, struct panfrost_bo *, bo) {
+-      assert(panfrost_bo_handle(*bo) > 0);
+-      handles[idx++] = panfrost_bo_handle(*bo);
+-
+-      /* Update the BO access flags so that panfrost_bo_wait() knows
+-       * about all pending accesses.
+-       * We only keep the READ/WRITE info since this is all the BO
+-       * wait logic cares about.
+-       * We also preserve existing flags as this batch might not
+-       * be the first one to access the BO.
+-       */
+-      (*bo)->gpu_access |= PAN_BO_ACCESS_RW;
++      uint32_t handle = panfrost_bo_handle(*bo);
++
++      assert(handle > 0);
++      handles[idx++] = handle;
+    }
+ }
+ 
+diff --git a/src/gallium/drivers/panfrost/pan_resource.c b/src/gallium/drivers/panfrost/pan_resource.c
+index 6fa2aad..b5d9811 100644
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -1421,37 +1421,67 @@ panfrost_load_tiled_images(struct panfrost_transfer *transfer,
+    }
+ }
+ 
+-#if MESA_DEBUG
++/* panfrost_resource_wait() only waits on panfrost_resource::bo even though
++ * there might be multiple other BOs attached to the resource.
++ *
++ * Here are some aspects that are worth noting:
++ * - rsrc::{separate_stencil,shadow_image}::bo is implicitly waited on because
++ *   panfrost_batch_{write,read}_rsrc() always record access to these resources
++ *   if they are present, so waiting on one of them is equivalent to waiting
++ *   on all of them
++ * - multiplanar resources should be covered because
++ *   panfrost_batch_{write,read}_rsrc() always record accesses on all planes
++ * - panfrost_resource::afbc::{layout,packed}_bo are not covered. They must
++ *   be waited on manually with a panfrost_bo_wait() call, because we don't
++ *   even track accesses to those a the panfrost_context::bo_access level
++ */
++bool
++panfrost_resource_wait(struct panfrost_resource *rsrc,
++                       struct panfrost_context *ctx, int64_t timeout_ns,
++                       bool wait_readers)
++{
++   /* The BO is shared, we have to do a KMD wait. */
++   if (rsrc->bo->flags & PAN_BO_SHARED)
++      return panfrost_bo_wait(rsrc->bo, timeout_ns, wait_readers);
+ 
+-static void
+-dump_headerblock(struct panfrost_resource *rsrc, uint32_t idx)
+-{
+-   panfrost_bo_wait(rsrc->bo, INT64_MAX, false);
+-
+-   uint8_t *ptr = rsrc->bo->ptr.cpu;
+-   struct pan_afbc_headerblock *header = (struct pan_afbc_headerblock *)
+-      (ptr + (idx * AFBC_HEADER_BYTES_PER_TILE));
+-   uint32_t *header_u32 = (uint32_t *)header;
+-   uint32_t *body = (uint32_t *)(ptr + header->payload.offset);
+-   struct pan_image_block_size block_sz =
+-      pan_afbc_subblock_size(rsrc->modifier);
+-   unsigned pixel_sz = util_format_get_blocksize(rsrc->base.format);
+-   unsigned uncompressed_size = pixel_sz * block_sz.width * block_sz.height;
+-   uint32_t size = pan_afbc_payload_size(7, *header, uncompressed_size);
+-
+-   fprintf(stderr, "  Header: %08x %08x %08x %08x (size: %u bytes)\n",
+-           header_u32[0], header_u32[1], header_u32[2], header_u32[3], size);
+-   if (size > 0) {
+-      fprintf(stderr, "  Body:   %08x %08x %08x %08x\n", body[0], body[1],
+-              body[2], body[3]);
+-   } else {
+-      fprintf(stderr, "  Color:  0x%02x%02x%02x%02x\n",
+-              header->color.rgba8888.r, header->color.rgba8888.g,
+-              header->color.rgba8888.b, header->color.rgba8888.a);
++   uint32_t handle = panfrost_bo_handle(rsrc->bo);
++   uint32_t *pending_access = NULL;
++   uint32_t seqno = 0, access = 0;
++
++   if (util_dynarray_num_elements(&ctx->bo_access, uint32_t) > handle) {
++      pending_access = util_dynarray_element(&ctx->bo_access, uint32_t, handle);
++      seqno = *pending_access >> 2;
++      access = *pending_access & PAN_BO_ACCESS_RW;
++   }
++
++   uint32_t mask = wait_readers ? PAN_BO_ACCESS_RW : PAN_BO_ACCESS_WRITE;
++   bool ready = false;
++
++   /* If the seqno is zero, it means the entry was uninitialized, and we can't
++    * trust it because it might come from an allocation failure when we try to
++    * resize the bo_access array in panfrost_context_report_bo_access(). In
++    * that case, we just take the hit and do a KMD wait.
++    */
++   if (seqno > 0) {
++      /* If the seqno don't match, the BO has been returned and a fresh one
++       * allocated with the same handle. In that case, pan_bo guarantees the
++       * buffer is idle.
++       */
++      if (rsrc->bo->seqno != seqno || !(access & mask))
++         ready = true;
+    }
+-   fprintf(stderr, "\n");
++
++   if (!ready)
++      ready = panfrost_bo_wait(rsrc->bo, timeout_ns, wait_readers);
++
++   if (ready && pending_access)
++      *pending_access &= ~mask;
++
++   return ready;
+ }
+ 
++#if MESA_DEBUG
++
+ void
+ pan_dump_resource(struct panfrost_context *ctx, struct panfrost_resource *rsc)
+ {
+@@ -1487,7 +1517,7 @@ pan_dump_resource(struct panfrost_context *ctx, struct panfrost_resource *rsc)
+    }
+ 
+    panfrost_flush_writer(ctx, linear, "dump image");
+-   panfrost_bo_wait(linear->bo, INT64_MAX, false);
++   panfrost_resource_wait(linear, ctx, INT64_MAX, false);
+ 
+    if (!panfrost_bo_mmap(linear->bo)) {
+       static unsigned frame_count = 0;
+@@ -1623,7 +1653,7 @@ panfrost_ptr_map(struct pipe_context *pctx, struct pipe_resource *resource,
+           (valid || panfrost_any_batch_writes_rsrc(ctx, rsrc))) {
+          pan_blit_to_staging(pctx, transfer);
+          panfrost_flush_writer(ctx, staging, "AFBC/AFRC tex read staging blit");
+-         panfrost_bo_wait(staging->bo, INT64_MAX, false);
++         panfrost_resource_wait(staging, ctx, INT64_MAX, false);
+       }
+ 
+       if (panfrost_bo_mmap(staging->bo))
+@@ -1670,7 +1700,7 @@ panfrost_ptr_map(struct pipe_context *pctx, struct pipe_resource *resource,
+        */
+ 
+       panfrost_flush_writer(ctx, rsrc, "Shadow resource creation");
+-      panfrost_bo_wait(bo, INT64_MAX, false);
++      panfrost_resource_wait(rsrc, ctx, INT64_MAX, false);
+ 
+       create_new_bo = true;
+       copy_resource = !(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE);
+@@ -1695,7 +1725,7 @@ panfrost_ptr_map(struct pipe_context *pctx, struct pipe_resource *resource,
+        * batches), we try to allocate a new one to avoid waiting.
+        */
+       if (panfrost_any_batch_reads_rsrc(ctx, rsrc) ||
+-          !panfrost_bo_wait(bo, 0, true)) {
++          !panfrost_resource_wait(rsrc, ctx, 0, true)) {
+          /* We want the BO to be MMAPed. */
+          uint32_t flags = bo->flags & ~PAN_BO_DELAY_MMAP;
+          struct panfrost_bo *newbo = NULL;
+@@ -1736,16 +1766,16 @@ panfrost_ptr_map(struct pipe_context *pctx, struct pipe_resource *resource,
+              */
+             panfrost_flush_batches_accessing_rsrc(
+                ctx, rsrc, "Resource access with high memory pressure");
+-            panfrost_bo_wait(bo, INT64_MAX, true);
++            panfrost_resource_wait(rsrc, ctx, INT64_MAX, true);
+          }
+       }
+    } else if (!(usage & PIPE_MAP_UNSYNCHRONIZED)) {
+       if (usage & PIPE_MAP_WRITE) {
+          panfrost_flush_batches_accessing_rsrc(ctx, rsrc, "Synchronized write");
+-         panfrost_bo_wait(bo, INT64_MAX, true);
++         panfrost_resource_wait(rsrc, ctx, INT64_MAX, true);
+       } else if (usage & PIPE_MAP_READ) {
+          panfrost_flush_writer(ctx, rsrc, "Synchronized read");
+-         panfrost_bo_wait(bo, INT64_MAX, false);
++         panfrost_resource_wait(rsrc, ctx, INT64_MAX, false);
+       }
+    }
+ 
+@@ -2274,7 +2304,7 @@ pan_resource_afbcp_update(struct panfrost_context *ctx,
+ 
+    /* 1st async AFBC-P step: get payload sizes. */
+    if (!prsrc->afbcp->layout_bo) {
+-      if (!panfrost_bo_wait(prsrc->bo, 0, false))
++      if (!panfrost_resource_wait(prsrc, ctx, 0, false))
+          return;
+       if (!pan_resource_afbcp_get_payload_sizes(ctx, prsrc))
+          goto stop_packing;
+@@ -2299,7 +2329,7 @@ pan_resource_afbcp_update(struct panfrost_context *ctx,
+ 
+    /* 3rd async AFBC-P step: pack. */
+    if (!prsrc->afbcp->packed_bo) {
+-      if (!panfrost_bo_wait(prsrc->bo, 0, false) ||
++      if (!panfrost_resource_wait(prsrc, ctx, 0, false) ||
+           !panfrost_bo_wait(prsrc->afbcp->layout_bo, 0, false))
+          return;
+       if (!pan_resource_afbcp_pack(ctx, prsrc))
+diff --git a/src/gallium/drivers/panfrost/pan_resource.h b/src/gallium/drivers/panfrost/pan_resource.h
+index bfd3343..2763a56 100644
+--- a/src/gallium/drivers/panfrost/pan_resource.h
++++ b/src/gallium/drivers/panfrost/pan_resource.h
+@@ -251,4 +251,8 @@ void pan_dump_resource(struct panfrost_context *ctx,
+ void panfrost_blit_no_afbc_legalization(struct pipe_context *pipe,
+                                         const struct pipe_blit_info *info);
+ 
++bool panfrost_resource_wait(struct panfrost_resource *rsrc,
++                            struct panfrost_context *ctx, int64_t timeout_ns,
++                            bool wait_readers);
++
+ #endif /* PAN_RESOURCE_H */
