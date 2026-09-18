@@ -15,7 +15,9 @@ if applyPatches then
   pkgs.mesa.overrideAttrs (oldAttrs: {
     patches = (oldAttrs.patches or [ ]) ++ [
       # ./41072.patch -- conflicts with 41123-edited (both touch gpu_access in pan_bo.c etc.)
-      ./43893.patch
+      (pkgs.lib.optional
+        (pkgs.lib.versionOlder (pkgs.mesa.version or "0") "26.2.3")
+        ./43893.patch)
       ./41123-edited.patch
       ./44053.patch
       ./42216.patch
