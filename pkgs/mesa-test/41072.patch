@@ -1,0 +1,212 @@
+From 7b59e43ef16dde40c2022c777caea6f153fc0938 Mon Sep 17 00:00:00 2001
+From: Eric Guo <eric.guo@nxp.com>
+Date: Tue, 21 Apr 2026 16:46:23 +0800
+Subject: [PATCH] panfrost: Add pthread_mutex_lock to protect gpu_access in BO
+
+Fix random OpenCL CTS failures in math_brute_force/test_bruteforce.
+
+Rusticl sub-buffers can alias one BO across multiple queue contexts.
+The non-shared panfrost_bo_wait() fast path relies on cached gpu_access
+state and could skip required waits under concurrent updates.
+
+Add serialize gpu_access producers/consumers with a dedicated
+bo_access_lock across submit-side set, bo_wait fast-path checks, and
+post-wait clear.
+
+Signed-off-by: Eric Guo <eric.guo@nxp.com>
+---
+ src/gallium/drivers/panfrost/pan_bo.c      | 23 ++++++++++++++++------
+ src/gallium/drivers/panfrost/pan_csf.c     | 16 ++++++++++++---
+ src/gallium/drivers/panfrost/pan_device.c  |  2 ++
+ src/gallium/drivers/panfrost/pan_device.h  |  3 +++
+ src/gallium/drivers/panfrost/pan_jm.c      |  4 ++++
+ src/gallium/drivers/panfrost/pan_mempool.c |  4 ++++
+ 6 files changed, 43 insertions(+), 9 deletions(-)
+
+diff --git a/src/gallium/drivers/panfrost/pan_bo.c b/src/gallium/drivers/panfrost/pan_bo.c
+index 7ec9c54635b4..e94245ceb748 100644
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -139,31 +139,42 @@ bool
+ panfrost_bo_wait(struct panfrost_bo *bo, int64_t timeout_ns, bool wait_readers)
+ {
+    PAN_TRACE_FUNC(PAN_TRACE_GL_BO);
++   struct panfrost_device *dev = bo->dev;
++   int ret;
+ 
+    /* If the BO has been exported or imported we can't rely on the cached
+     * state, we need to call the WAIT_BO ioctl.
+     */
+    if (!(bo->flags & PAN_BO_SHARED)) {
++      pthread_mutex_lock(&dev->bo_access_lock);
++
+       /* If ->gpu_access is 0, the BO is idle, no need to wait. */
+-      if (!bo->gpu_access)
++      if (!bo->gpu_access) {
++         pthread_mutex_unlock(&dev->bo_access_lock);
+          return true;
++      }
+ 
+       /* If the caller only wants to wait for writers and no
+        * writes are pending, we don't have to wait.
+        */
+-      if (!wait_readers && !(bo->gpu_access & PAN_BO_ACCESS_WRITE))
++      if (!wait_readers && !(bo->gpu_access & PAN_BO_ACCESS_WRITE)) {
++         pthread_mutex_unlock(&dev->bo_access_lock);
+          return true;
++      }
+    }
+ 
+-   if (pan_kmod_bo_wait(bo->kmod_bo, timeout_ns, !wait_readers)) {
++   ret = pan_kmod_bo_wait(bo->kmod_bo, timeout_ns, !wait_readers);
++
++   if (!(bo->flags & PAN_BO_SHARED)) {
+       /* Set gpu_access to 0 so that the next call to bo_wait()
+        * doesn't have to call the WAIT_BO ioctl.
+        */
+-      bo->gpu_access = 0;
+-      return true;
++      if(ret)
++         bo->gpu_access = 0;
++      pthread_mutex_unlock(&dev->bo_access_lock);
+    }
+ 
+-   return false;
++   return ret;
+ }
+ 
+ /* Helper to calculate the bucket index of a BO */
+diff --git a/src/gallium/drivers/panfrost/pan_csf.c b/src/gallium/drivers/panfrost/pan_csf.c
+index 35207942b62b..44b5cd9d8e07 100644
+--- a/src/gallium/drivers/panfrost/pan_csf.c
++++ b/src/gallium/drivers/panfrost/pan_csf.c
+@@ -459,6 +459,8 @@ csf_attach_sync_points(struct panfrost_batch *batch, uint32_t vm_sync_handle,
+    /* There should be no invisble allocation on CSF. */
+    assert(batch->invisible_pool.bos.size == 0);
+ 
++   pthread_mutex_lock(&dev->bo_access_lock);
++
+    /* Attach sync points to batch-private BOs first. We assume BOs can
+     * be written by the GPU to keep things simple.
+     */
+@@ -466,8 +468,10 @@ csf_attach_sync_points(struct panfrost_batch *batch, uint32_t vm_sync_handle,
+       (*bo)->gpu_access |= PAN_BO_ACCESS_RW;
+       ret = panthor_kmod_bo_attach_sync_point((*bo)->kmod_bo, vm_sync_handle,
+                                               vm_sync_signal_point, true);
+-      if (ret)
++      if (ret) {
++         pthread_mutex_unlock(&dev->bo_access_lock);
+          return ret;
++      }
+    }
+ 
+    util_dynarray_foreach(&batch->csf.cs_chunk_pool.bos, struct panfrost_bo *,
+@@ -475,8 +479,10 @@ csf_attach_sync_points(struct panfrost_batch *batch, uint32_t vm_sync_handle,
+       (*bo)->gpu_access |= PAN_BO_ACCESS_RW;
+       ret = panthor_kmod_bo_attach_sync_point((*bo)->kmod_bo, vm_sync_handle,
+                                               vm_sync_signal_point, true);
+-      if (ret)
++      if (ret) {
++         pthread_mutex_unlock(&dev->bo_access_lock);
+          return ret;
++      }
+    }
+ 
+    /* Attach the VM sync point to all resources accessed by the batch. */
+@@ -493,10 +499,14 @@ csf_attach_sync_points(struct panfrost_batch *batch, uint32_t vm_sync_handle,
+       ret = panthor_kmod_bo_attach_sync_point(bo->kmod_bo, vm_sync_handle,
+                                               vm_sync_signal_point,
+                                               flags & PAN_BO_ACCESS_WRITE);
+-      if (ret)
++      if (ret) {
++         pthread_mutex_unlock(&dev->bo_access_lock);
+          return ret;
++      }
+    }
+ 
++   pthread_mutex_unlock(&dev->bo_access_lock);
++
+    /* And finally transfer the VM sync point to the context syncobj. */
+    return drmSyncobjTransfer(panfrost_device_fd(dev), ctx->syncobj, 0,
+                              vm_sync_handle, vm_sync_signal_point, 0);
+diff --git a/src/gallium/drivers/panfrost/pan_device.c b/src/gallium/drivers/panfrost/pan_device.c
+index 1e222aa91414..2443c7e3d694 100644
+--- a/src/gallium/drivers/panfrost/pan_device.c
++++ b/src/gallium/drivers/panfrost/pan_device.c
+@@ -77,6 +77,7 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
+ 
+    util_sparse_array_init(&dev->bo_map, sizeof(struct panfrost_bo), 512);
+ 
++   pthread_mutex_init(&dev->bo_access_lock, NULL);
+    pthread_mutex_init(&dev->bo_cache.lock, NULL);
+    list_inithead(&dev->bo_cache.lru);
+ 
+@@ -140,6 +141,7 @@ panfrost_close_device(struct panfrost_device *dev)
+       panfrost_bo_unreference(dev->sample_positions);
+       panfrost_bo_cache_evict_all(dev);
+       pthread_mutex_destroy(&dev->bo_cache.lock);
++      pthread_mutex_destroy(&dev->bo_access_lock);
+       util_sparse_array_finish(&dev->bo_map);
+    }
+ 
+diff --git a/src/gallium/drivers/panfrost/pan_device.h b/src/gallium/drivers/panfrost/pan_device.h
+index f12348c52280..63ff95f05e33 100644
+--- a/src/gallium/drivers/panfrost/pan_device.h
++++ b/src/gallium/drivers/panfrost/pan_device.h
+@@ -113,6 +113,9 @@ struct panfrost_device {
+ 
+    struct renderonly *ro;
+ 
++   /* Protects panfrost_bo::gpu_access updates and bo_wait fast-path checks. */
++   pthread_mutex_t bo_access_lock;
++
+    pthread_mutex_t bo_map_lock;
+    struct util_sparse_array bo_map;
+ 
+diff --git a/src/gallium/drivers/panfrost/pan_jm.c b/src/gallium/drivers/panfrost/pan_jm.c
+index 620800d4efb4..e2c796328482 100644
+--- a/src/gallium/drivers/panfrost/pan_jm.c
++++ b/src/gallium/drivers/panfrost/pan_jm.c
+@@ -111,6 +111,8 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
+    pan_bo_access *flags = util_dynarray_begin(&batch->bos);
+    unsigned end_bo = util_dynarray_num_elements(&batch->bos, pan_bo_access);
+ 
++   pthread_mutex_lock(&dev->bo_access_lock);
++
+    for (int i = 0; i < end_bo; ++i) {
+       if (!flags[i])
+          continue;
+@@ -130,6 +132,8 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
+       bo->gpu_access |= flags[i] & (PAN_BO_ACCESS_RW);
+    }
+ 
++   pthread_mutex_unlock(&dev->bo_access_lock);
++
+    panfrost_pool_get_bo_handles(&batch->pool,
+                                 bo_handles + submit.bo_handle_count);
+    submit.bo_handle_count += panfrost_pool_num_bos(&batch->pool);
+diff --git a/src/gallium/drivers/panfrost/pan_mempool.c b/src/gallium/drivers/panfrost/pan_mempool.c
+index 1c902616a226..1869583a9537 100644
+--- a/src/gallium/drivers/panfrost/pan_mempool.c
++++ b/src/gallium/drivers/panfrost/pan_mempool.c
+@@ -101,6 +101,8 @@ panfrost_pool_get_bo_handles(struct panfrost_pool *pool, uint32_t *handles)
+    assert(pool->owned && "pool does not track BOs in unowned mode");
+ 
+    unsigned idx = 0;
++   pthread_mutex_lock(&pool->dev->bo_access_lock);
++
+    util_dynarray_foreach(&pool->bos, struct panfrost_bo *, bo) {
+       assert(panfrost_bo_handle(*bo) > 0);
+       handles[idx++] = panfrost_bo_handle(*bo);
+@@ -114,6 +116,8 @@ panfrost_pool_get_bo_handles(struct panfrost_pool *pool, uint32_t *handles)
+        */
+       (*bo)->gpu_access |= PAN_BO_ACCESS_RW;
+    }
++
++   pthread_mutex_unlock(&pool->dev->bo_access_lock);
+ }
+ 
+ #define PAN_GUARD_SIZE 4096
+-- 
+GitLab
+
