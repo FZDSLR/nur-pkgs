@@ -9,14 +9,13 @@ let
   # Within the active window aarch64-linux gets every patch.
   applyPatches =
     pkgs.stdenv.hostPlatform.isAarch64
-    && pkgs.lib.versionAtLeast (pkgs.mesa.version or "0") "26.2"
-    && pkgs.lib.versionOlder (pkgs.mesa.version or "0") "26.2.3";
+    && pkgs.lib.versionAtLeast (pkgs.mesa.version or "0") "26.2";
 in
 if applyPatches then
   pkgs.mesa.overrideAttrs (oldAttrs: {
     patches = (oldAttrs.patches or [ ]) ++ [
       # ./41072.patch -- conflicts with 41123-edited (both touch gpu_access in pan_bo.c etc.)
-      ./43893.patch
+      # ./43893.patch
       ./41123-edited.patch
       ./44053.patch
       ./42216.patch
