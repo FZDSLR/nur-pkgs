@@ -1,0 +1,67 @@
+name: "Build and populate cache (specific nixpkgs)"
+on:
+  workflow_dispatch:
+    inputs:
+      nixpkgs_hash:
+        description: 'Nixpkgs commit SHA (e.g. a1b2c3d...). Leave empty to use nixpkgs-unstable branch.'
+        required: false
+        default: ''
+        type: string
+jobs:
+  tests:
+    strategy:
+      matrix:
+        nurRepo:
+          - fzdslr
+        cachixName:
+          - fzdslr-nur
+        runs-on:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+        system:
+          - x86_64-linux
+          - aarch64-linux
+        exclude:
+          - runs-on: ubuntu-24.04-arm
+            system: x86_64-linux
+          - runs-on: ubuntu-latest
+            system: aarch64-linux
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+    - name: Resolve nixpkgs URL
+      id: nixpkgs
+      run: |
+        if [ -z "${{ inputs.nixpkgs_hash }}" ]; then
+          echo "url=nixpkgs=https://github.com/NixOS/nixpkgs/archive/refs/heads/nixpkgs-unstable.tar.gz" >> "$GITHUB_OUTPUT"
+        else
+          echo "url=nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ inputs.nixpkgs_hash }}.tar.gz" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Checkout repository
+      uses: actions/checkout@v6
+    - name: Install nix
+      uses: cachix/install-nix-action@v31
+      with:
+        nix_path: "${{ steps.nixpkgs.outputs.url }}"
+        extra_nix_config: |
+          experimental-features = nix-command flakes
+          access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+    - name: Show nixpkgs version
+      run: nix-instantiate --eval -E '(import <nixpkgs> {}).lib.version'
+    - name: Setup cachix
+      uses: cachix/cachix-action@v16
+      if: ${{ matrix.cachixName != '<YOUR_CACHIX_NAME>' }}
+      with:
+        name: ${{ matrix.cachixName }}
+        signingKey: '${{ secrets.CACHIX_SIGNING_KEY }}'
+        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+    - name: Check evaluation
+      run: |
+        nix-env -f . -qa \* --meta --xml \
+          --allowed-uris https://static.rust-lang.org \
+          --option restrict-eval true \
+          --option allow-import-from-derivation true \
+          --drv-path --show-trace \
+          -I nixpkgs=$(nix-instantiate --find-file nixpkgs) \
+          -I $PWD
+    - name: Build nix packages
+      run: nix shell -f '<nixpkgs>' nix-build-uncached -c nix-build-uncached ci.nix -A cacheOutputs --system ${{ matrix.system }}
