@@ -7,8 +7,7 @@
 #
 # rev 0e760c82fdf40d3162b8ddd15cb60a03f8b54c49 对应特定 board/kernel 的快照。
 #
-# 当前 sha256 为 lib.fakeSha256 占位：本地无法访问 googlesource 校验，
-# 交由 CI（GitHub Actions 出网可达）在首次构建时打印真实 hash 后回填。
+# sha256 来自 CI 首次构建失败时的报错，已回填。
 # CI 配置见 .github/workflows/build.yml，缓存产物推送到 fzdslr-nur.cachix.org。
 #
 # 注意：pkgs.fetchgit 默认带 preferLocalBuild = true，会被 ci.nix 的
@@ -17,5 +16,5 @@
 (pkgs.fetchgit {
   url = "https://chromium.googlesource.com/chromiumos/third_party/kernel.git";
   rev = "0e760c82fdf40d3162b8ddd15cb60a03f8b54c49";
-  sha256 = pkgs.lib.fakeSha256;
+  sha256 = "sha256-vQ+ECbBkqn4UHUp9OCP7fMcl2ak6kqTW6v5ULZNePT4=";
 }).overrideAttrs (_: { preferLocalBuild = false; })
