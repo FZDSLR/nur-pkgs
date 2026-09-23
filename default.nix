@@ -18,4 +18,5 @@ rec {
 
   niri-patched = import ./pkgs/niri-patched { inherit pkgs; };
   mesa-41072 = import ./pkgs/mesa-41072 { inherit pkgs; };
+  cros-kernel-R152-16765B-6.6 = import ./pkgs/cros-kernel-R152-16765B-6.6 { inherit pkgs; };
 }
