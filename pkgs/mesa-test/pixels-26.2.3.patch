@@ -1,0 +1,22 @@
+diff --git a/src/mesa/state_tracker/st_cb_drawpixels.c b/src/mesa/state_tracker/st_cb_drawpixels.c
+index 8848db1..6dc5be0 100644
+--- a/src/mesa/state_tracker/st_cb_drawpixels.c
++++ b/src/mesa/state_tracker/st_cb_drawpixels.c
+@@ -1589,8 +1589,15 @@ blit_copy_pixels(struct gl_context *ctx, GLint srcx, GLint srcy,
+       }
+ 
+       if (rbRead != rbDraw ||
+-          !_mesa_regions_overlap(readX, readY, readX + readW, readY + readH,
+-                                 drawX, drawY, drawX + drawW, drawY + drawH)) {
++          /* For same-resource (rbRead == rbDraw) blits we additionally require
++           * texture_barrier support.  Pixel-level overlap checks cannot see
++           * tile-level hazards on Mali / other tile-based GPUs, where a
++           * src->dst blit without an explicit barrier may overwrite source
++           * tiles mid-blit, producing random missing-tile artifacts.
++           */
++          (screen->caps.texture_barrier &&
++           !_mesa_regions_overlap(readX, readY, readX + readW, readY + readH,
++                                  drawX, drawY, drawX + drawW, drawY + drawH))) {
+          struct pipe_blit_info blit;
+ 
+          memset(&blit, 0, sizeof(blit));

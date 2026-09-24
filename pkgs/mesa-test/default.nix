@@ -20,6 +20,7 @@ if applyPatches then
       # ./01e6a055-revert.patch
       ./44680.patch
       ./44611.patch
+      ./pixels-26.2.3.patch
       ./44053.patch
       ./42216.patch
       ./44495.patch
