@@ -18,4 +18,5 @@ rec {
 
   niri-patched = import ./pkgs/niri-patched { inherit pkgs; };
   mesa-41072 = import ./pkgs/mesa-41072 { inherit pkgs; };
+  mesa-test = import ./pkgs/mesa-test { inherit pkgs; };
 }
