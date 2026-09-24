@@ -18,6 +18,7 @@ if applyPatches then
       #       ./43893.patch
       ./41123-edited.patch
       # ./01e6a055-revert.patch
+      ./44680.patch
       ./44611.patch
       ./44053.patch
       ./42216.patch
