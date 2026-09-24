@@ -17,6 +17,7 @@ if applyPatches then
       # ./41072.patch -- conflicts with 41123-edited (both touch gpu_access in pan_bo.c etc.)
       #       ./43893.patch
       ./41123-edited.patch
+      ./01e6a055-revert.patch
       ./44611.patch
       ./44053.patch
       ./42216.patch
