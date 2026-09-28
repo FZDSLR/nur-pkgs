@@ -37,7 +37,7 @@ jobs:
           echo "url=nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ inputs.nixpkgs_hash }}.tar.gz" >> "$GITHUB_OUTPUT"
         fi
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
     - name: Install nix
       uses: cachix/install-nix-action@v31
       with:
