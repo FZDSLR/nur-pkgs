@@ -1,0 +1,32 @@
+From e36f69d1587584f34ad151ebb1e0d1fdad37e219 Mon Sep 17 00:00:00 2001
+From: Yiwei Zhang <zzyiwei@chromium.org>
+Date: Wed, 16 Sep 2026 23:17:55 -0700
+Subject: [PATCH] pan/kmod: dummy BO is per VM for emulated sparse
+
+Our downstream panthor is at 1.8.0 built up with backports, and an issue
+in our shrinker backport has exposed this while running below:
+- dEQP-VK.api.buffer.suballocation.*
+
+Fixes: 306539a3c70 ("pan/kmod: Introduce vm_op buffering and sparse mapping emulation")
+Reviewed-by: Boris Brezillon <boris.brezillon@collabora.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44495>
+---
+ src/panfrost/lib/kmod/pan_kmod.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
+index 0be278d77f09..8d37023491bb 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -856,7 +856,7 @@ pan_kmod_get_dummy_object(struct pan_kmod_vm *vm)
+    simple_mtx_lock(&vm->sparse_dummy.lock);
+ 
+    if (!vm->sparse_dummy.bo) {
+-      struct pan_kmod_bo *bo = pan_kmod_bo_alloc(vm->dev, NULL, PAN_PGSIZE_2M,
++      struct pan_kmod_bo *bo = pan_kmod_bo_alloc(vm->dev, vm, PAN_PGSIZE_2M,
+                                                  PAN_KMOD_BO_FLAG_NO_MMAP);
+       if (!bo)
+          goto dummy_exit;
+-- 
+GitLab
+
