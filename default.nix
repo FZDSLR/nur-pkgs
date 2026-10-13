@@ -17,7 +17,6 @@ rec {
   overlays = import ./overlays; # nixpkgs overlays
 
   niri-patched = import ./pkgs/niri-patched { inherit pkgs; };
-  mesa-41072 = import ./pkgs/mesa-41072 { inherit pkgs; };
 
   libva-v4l2_request-sofus13 = pkgs.callPackage ./pkgs/libva-v4l2_request-sofus13 { };
 }
