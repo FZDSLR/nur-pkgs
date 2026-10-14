@@ -41,7 +41,13 @@ jobs:
           # Condition 3 filters out things like `pkgs.<x>.overrideAttrs {...}`
           # which inherit `passthru.updateScript` from upstream nixpkgs but are
           # not packages we own or want to auto-bump.
-          PKGS=$(nix-instantiate --eval --strict --json -E '
+          #
+          # IMPORTANT: the Nix expression returns a list of attrsets directly.
+          # `nix-instantiate --eval --strict --json` then serialises that list
+          # to a proper JSON array. Wrapping with `builtins.toJSON` would
+          # produce a *string* (whose contents are JSON), and the --json flag
+          # would then re-encode it as a JSON-escaped string — defeating jq.
+          nix-instantiate --eval --strict --json -E '
             let
               pkgs = import ./default.nix { };
               isOurPackage = v:
@@ -56,12 +62,11 @@ jobs:
               names = builtins.attrNames pkgs;
               updatable = builtins.filter (n: isUpdatable pkgs.${n} or null) names;
             in
-              builtins.toJSON (map (name: {
+              map (name: {
                 inherit name;
                 oldVersion = pkgs.${name}.version or "?";
-              }) updatable)
-          ')
-          printf '%s' "$PKGS" | jq . > /tmp/updatable.json
+              }) updatable
+          ' > /tmp/updatable.json
           COUNT=$(jq 'length' /tmp/updatable.json)
           echo "package-count=$COUNT" >> "$GITHUB_OUTPUT"
           echo "Updatable packages: $COUNT"
@@ -111,8 +116,11 @@ jobs:
             # Run nix-update against this package. We invoke the CLI directly
             # (no passthru.updateScript argv dispatch), so the wiring is uniform
             # across packages regardless of how their updateScript was set up.
+            # No --version flag: that defaults to STABLE. Passing --version=patch
+            # would be misinterpreted (FIXED-mode literal string "patch" → 404),
+            # so we let nix-update pick the newest stable tag automatically.
             if ! nix shell -f '<nixpkgs>' nix-update -c \
-                nix-update "$NAME" --version=patch 2>&1; then
+                nix-update "$NAME" 2>&1; then
               echo "  WARNING: nix-update exited non-zero for $NAME. Continuing."
               FAIL_COUNT=$((FAIL_COUNT + 1))
               continue
@@ -136,7 +144,7 @@ jobs:
 
             # PR body kept short and on a single line — multi-line bodies
             # interact badly with YAML's `run: |` literal block indentation.
-            BODY="Automated bump via nix-update; $NAME: $OLD -> $NEW. --version=patch; for minor/major bumps, drop the flag or dispatch manually."
+            BODY="Automated bump via nix-update; $NAME: $OLD -> $NEW. STABLE preference (no --version flag). Review and merge."
             gh pr create \
               --base main \
               --head "$BRANCH" \
