@@ -1,0 +1,158 @@
+name: "Update NUR packages"
+on:
+  schedule:
+    # weekly Monday 04:13 UTC. Random hour offset to dodge GH Action peaks.
+    - cron: "13 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: update-nur
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      # checkout uses the GH token; we push branches and open PRs with it.
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          # Match the nixpkgs used by build.yml so lockfile/toolchain align.
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/refs/heads/nixpkgs-unstable.tar.gz
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Discover updatable packages
+        id: discover
+        run: |
+          # shellcheck disable=SC2016  # The single-quoted Nix expression is literal by design.
+          # Discovery walks `default.nix` and selects:
+          #   1. attribute is a Nix derivation
+          #   2. it has `passthru.updateScript` set (and non-null)
+          #   3. its `meta.position` is inside this repo's pkgs/<name>/default.nix
+          # Condition 3 filters out things like `pkgs.<x>.overrideAttrs {...}`
+          # which inherit `passthru.updateScript` from upstream nixpkgs but are
+          # not packages we own or want to auto-bump.
+          PKGS=$(nix-instantiate --eval --strict --json -E '
+            let
+              pkgs = import ./default.nix { };
+              isOurPackage = v:
+                let pos = v.meta.position or ""; in
+                builtins.match "${toString ./.}/pkgs/.+/default\\.nix:.+" pos
+                  != null;
+              isUpdatable = v:
+                isOurPackage v
+                && v ? type && v.type == "derivation"
+                && v ? passthru && v.passthru ? updateScript
+                && v.passthru.updateScript != null;
+              names = builtins.attrNames pkgs;
+              updatable = builtins.filter (n: isUpdatable pkgs.${n} or null) names;
+            in
+              builtins.toJSON (map (name: {
+                inherit name;
+                oldVersion = pkgs.${name}.version or "?";
+              }) updatable)
+          ')
+          printf '%s' "$PKGS" | jq . > /tmp/updatable.json
+          COUNT=$(jq 'length' /tmp/updatable.json)
+          echo "package-count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Updatable packages: $COUNT"
+          jq -r '.[] | "  - \(.name) (v\(.oldVersion))"' /tmp/updatable.json
+
+      - name: Bail if nothing to update
+        if: steps.discover.outputs.package-count == '0'
+        run: |
+          echo "No packages with passthru.updateScript that lives under our pkgs/ tree."
+          echo 'If you want this package updated here, add passthru.updateScript = nix-update-script { attrPath = "<name>"; }; to its default.nix.'
+
+      - name: Run nix-update per package
+        if: steps.discover.outputs.package-count != '0'
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          if [ ! -s /tmp/updatable.json ]; then
+            echo "Discovery artifact missing."
+            exit 0
+          fi
+
+          COUNT=$(jq 'length' /tmp/updatable.json)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Nothing to do."
+            exit 0
+          fi
+
+          FAIL_COUNT=0
+          SUCCESS_COUNT=0
+
+          for i in $(seq 0 $((COUNT - 1))); do
+            NAME=$(jq -r ".[$i].name" /tmp/updatable.json)
+            OLD=$(jq -r ".[$i].oldVersion" /tmp/updatable.json)
+            echo ""
+            echo "::: $NAME (v$OLD) :::"
+
+            # Reset tree before each run so a previous iteration's leftovers
+            # don't leak into this one's diff.
+            git checkout -- pkgs/ || true
+
+            # Run nix-update against this package. We invoke the CLI directly
+            # (no passthru.updateScript argv dispatch), so the wiring is uniform
+            # across packages regardless of how their updateScript was set up.
+            if ! nix shell -f '<nixpkgs>' nix-update -c \
+                nix-update "$NAME" --version=patch 2>&1; then
+              echo "  WARNING: nix-update exited non-zero for $NAME. Continuing."
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              continue
+            fi
+
+            if git diff --quiet -- "pkgs/$NAME/"; then
+              echo "  no upstream changes for $NAME"
+              continue
+            fi
+
+            NEW=$(nix-instantiate --eval --strict -E \
+              "(import ./default.nix {}).$NAME.version" | tr -d '"')
+
+            BRANCH="update/${NAME}-$(date -u +%Y%m%d-%H%M%S)"
+            git checkout -b "$BRANCH"
+            # Add the package dir, plus any sibling lockfile the updater may
+            # have rewritten (e.g. Cargo.lock for Rust crates).
+            git add -A
+            git commit -m "$NAME: $OLD -> $NEW"
+            git push -u origin "$BRANCH"
+
+            # PR body kept short and on a single line — multi-line bodies
+            # interact badly with YAML's `run: |` literal block indentation.
+            BODY="Automated bump via nix-update; $NAME: $OLD -> $NEW. --version=patch; for minor/major bumps, drop the flag or dispatch manually."
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "$NAME: $OLD -> $NEW" \
+              --body "$BODY"
+            echo "  PR opened for $NAME -> v$NEW"
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+
+            # Drop back to the original branch for the next iteration
+            git checkout main -- . || true
+            git branch -D "$BRANCH" || true
+          done
+
+          echo ""
+          echo "Summary: $SUCCESS_COUNT packages updated, $FAIL_COUNT failures."
+
+          if [ "$FAIL_COUNT" -gt 0 ]; then
+            exit 1
+          fi
