@@ -19,4 +19,6 @@ rec {
   niri-patched = import ./pkgs/niri-patched { inherit pkgs; };
 
   libva-v4l2_request-sofus13 = pkgs.callPackage ./pkgs/libva-v4l2_request-sofus13 { };
+
+  cnmplayer = pkgs.callPackage ./pkgs/cnmplayer { };
 }
