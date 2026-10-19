@@ -17,13 +17,13 @@
 
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "cnmplayer";
-  version = "0.7.0";
+  version = "0.7.1";
 
   src = fetchFromGitHub {
     owner = "professor-lee";
     repo = "CNMPlayer";
     tag = "v${finalAttrs.version}";
-    hash = "sha256-VkJd/cMNcaGAfpU/Z2RT152mc/WXA5WuiE1YMt8qeTY=";
+    hash = "sha256-qfnurDFFzZMUmZdAFBBvBN5egSGUMnzhr5oW6O3guMI=";
   };
 
   # When `cargoLock` is set, buildRustPackage takes the `importCargoLock`
