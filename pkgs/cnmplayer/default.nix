@@ -17,13 +17,13 @@
 
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "cnmplayer";
-  version = "0.7.1";
+  version = "0.7.2";
 
   src = fetchFromGitHub {
     owner = "professor-lee";
     repo = "CNMPlayer";
     tag = "v${finalAttrs.version}";
-    hash = "sha256-qfnurDFFzZMUmZdAFBBvBN5egSGUMnzhr5oW6O3guMI=";
+    hash = "sha256-FLTqNrIDcy+Irfbo2oT5rcYxPY9LMULiARkmBPBcNqE=";
   };
 
   # When `cargoLock` is set, buildRustPackage takes the `importCargoLock`
@@ -32,10 +32,6 @@ rustPlatform.buildRustPackage (finalAttrs: {
   # deps, and per-crate `checksum` entries inside Cargo.lock for crates.io.
   cargoLock = {
     lockFile = ./Cargo.lock;
-    outputHashes = {
-      "rodio-0.22.2" = "sha256-m0sFqH7Ct02vvGPI44UKjBY04YEFd/wU0WrMVpWF0DM=";
-      "see-0.1.1" = "sha256-DqesR2JixrRixSTvuTPlLaQpLIsif6LieqzpLzFJOO0=";
-    };
   };
 
   nativeBuildInputs = [
